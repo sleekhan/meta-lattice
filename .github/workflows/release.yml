@@ -82,6 +82,7 @@ jobs:
           ### 📦 Included in each package:
           - Precompiled standalone binary (`meta-lattice` or `meta-lattice.exe`)
           - One-click installer (`install.sh` / `install.ps1`)
+          - Agent & IDE integrations (`.agents/`, `.claude-plugin/`, `.codex/`, `.mcp.json`, `AGENTS.md`, `GEMINI.md`, `hooks/`)
           - Pre-configured skills (`skills/`) and slash commands (`commands/`)
           - Full documentation and license
 

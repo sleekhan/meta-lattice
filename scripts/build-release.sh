@@ -50,6 +50,9 @@ for target in "${TARGETS[@]}"; do
   cp "${ROOT_DIR}/README.md" "${STAGING_DIR}/"
   cp "${ROOT_DIR}/LICENSE" "${STAGING_DIR}/"
   cp "${ROOT_DIR}/${INSTALLER}" "${STAGING_DIR}/"
+  [ -f "${ROOT_DIR}/AGENTS.md" ] && cp "${ROOT_DIR}/AGENTS.md" "${STAGING_DIR}/"
+  [ -f "${ROOT_DIR}/GEMINI.md" ] && cp "${ROOT_DIR}/GEMINI.md" "${STAGING_DIR}/"
+  [ -f "${ROOT_DIR}/.mcp.json" ] && cp "${ROOT_DIR}/.mcp.json" "${STAGING_DIR}/"
 
   # Bundle native LatticeDB shared library if available
   if [ -d "${ROOT_DIR}/deps/latticedb/lib/${OS}-${ARCH}" ]; then
@@ -62,6 +65,20 @@ for target in "${TARGETS[@]}"; do
   fi
   if [ -d "${ROOT_DIR}/skills" ]; then
     cp -r "${ROOT_DIR}/skills" "${STAGING_DIR}/"
+  fi
+  if [ -d "${ROOT_DIR}/hooks" ]; then
+    cp -r "${ROOT_DIR}/hooks" "${STAGING_DIR}/"
+  fi
+
+  # Bundle dot-directories for Google Antigravity, Claude Code, OpenAI Codex
+  if [ -d "${ROOT_DIR}/.agents" ]; then
+    cp -r "${ROOT_DIR}/.agents" "${STAGING_DIR}/"
+  fi
+  if [ -d "${ROOT_DIR}/.claude-plugin" ]; then
+    cp -r "${ROOT_DIR}/.claude-plugin" "${STAGING_DIR}/"
+  fi
+  if [ -d "${ROOT_DIR}/.codex" ]; then
+    cp -r "${ROOT_DIR}/.codex" "${STAGING_DIR}/"
   fi
 
   # 3. Create archive
