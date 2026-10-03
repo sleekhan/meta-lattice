@@ -1,0 +1,4 @@
+[mcp_servers.meta-lattice]
+enabled = true
+command = "./meta-lattice"
+args = ["mcp"]

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "meta-lattice": {
+      "command": "./meta-lattice",
+      "args": ["mcp"]
+    }
+  }
+}

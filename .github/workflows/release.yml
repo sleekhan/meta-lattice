@@ -1,0 +1,125 @@
+name: Release & Publish
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release Tag (e.g. v1.0.0)'
+        required: false
+        default: ''
+        type: string
+      draft:
+        description: 'Publish as Draft'
+        required: false
+        default: false
+        type: boolean
+      prerelease:
+        description: 'Publish as Pre-release'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-publish:
+    name: Build & Publish Release (No Tests)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: false
+
+      - name: Determine Version
+        id: version
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.tag_name }}" ]; then
+            TAG="${{ inputs.tag_name }}"
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            TAG="v1.0.0"
+          fi
+          
+          if [[ ! "$TAG" =~ ^v ]]; then
+            TAG="v${TAG}"
+          fi
+          
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Building version: $TAG"
+
+      - name: Build & Package (Windows, Linux, macOS)
+        shell: bash
+        run: |
+          chmod +x scripts/build-release.sh
+          ./scripts/build-release.sh "${{ steps.version.outputs.tag }}"
+
+      - name: Generate Release Notes Body
+        id: release_notes
+        shell: bash
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          CHECKSUMS=$(cat dist/checksums.txt)
+          
+          cat << 'EOF' > release_body.md
+          ## Meta-Lattice (Go Native) Release
+
+          Standalone, zero-dependency release for **Windows (x86_64)**, **Linux (amd64, arm64)**, and **macOS (Apple Silicon & Intel)**.
+
+          ### 📦 Included in each package:
+          - Precompiled standalone binary (`meta-lattice` or `meta-lattice.exe`)
+          - One-click installer (`install.sh` / `install.ps1`)
+          - Pre-configured skills (`skills/`) and slash commands (`commands/`)
+          - Full documentation and license
+
+          ### 🚀 Quick Installation
+          **Linux / macOS:**
+          ```bash
+          tar -xzf meta-lattice-*.tar.gz
+          cd meta-lattice-*
+          ./install.sh
+          ```
+
+          **Windows (PowerShell):**
+          ```powershell
+          Expand-Archive meta-lattice-*-windows-amd64.zip
+          cd meta-lattice-*-windows-amd64
+          powershell -ExecutionPolicy Bypass -File .\install.ps1
+          ```
+
+          ### 🔐 SHA256 Checksums
+          ```text
+          EOF
+          cat dist/checksums.txt >> release_body.md
+          cat << 'EOF' >> release_body.md
+          ```
+          EOF
+
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: "Meta-Lattice ${{ steps.version.outputs.tag }}"
+          body_path: release_body.md
+          draft: ${{ inputs.draft || false }}
+          prerelease: ${{ inputs.prerelease || false }}
+          generate_release_notes: true
+          files: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/checksums.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

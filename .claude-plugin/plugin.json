@@ -1,0 +1,21 @@
+{
+  "name": "meta-lattice",
+  "version": "1.0.0",
+  "description": "High-Performance Hierarchical Context Zoomer, Architecture Boundary Auditor, Blast Radius Estimator, and Incremental AST Cache for Claude Code powered by LatticeDB.",
+  "author": {
+    "name": "Meta-Lattice Team"
+  },
+  "homepage": "https://github.com/jeffhajewski/latticedb",
+  "repository": "https://github.com/jeffhajewski/latticedb",
+  "license": "MIT",
+  "keywords": [
+    "latticedb",
+    "claude-code",
+    "hierarchical-context",
+    "token-saving",
+    "architecture-auditor",
+    "blast-radius",
+    "ast-cache",
+    "mcp"
+  ]
+}

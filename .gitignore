@@ -1,0 +1,17 @@
+# Build binaries
+meta-lattice
+*.exe
+*.dll
+*.so
+*.dylib
+!deps/latticedb/**
+dist/
+
+# Lattice cache & graph storage
+.lattice/
+.lattice-arch.json.tmp
+*.tmp
+
+# OS files
+.DS_Store
+Thumbs.db
