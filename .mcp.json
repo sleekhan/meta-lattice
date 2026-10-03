@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "meta-lattice": {
-      "command": "./meta-lattice",
+      "command": "${CLAUDE_PLUGIN_ROOT}/meta-lattice",
       "args": ["mcp"]
     }
   }
