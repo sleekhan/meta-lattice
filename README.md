@@ -168,20 +168,22 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 Claude Code에서는 **(1) 플러그인(Plugin) 방식**, **(2) 자동 설치기 방식**, **(3) MCP 직접 등록 방식** 중 원하는 형태로 설치할 수 있습니다.
 
 ##### 방법 A. Claude Code 플러그인(Plugin)으로 설치
-Meta-Lattice는 Claude Code 공식 플러그인 매니페스트([`.claude-plugin/plugin.json`](file:///.claude-plugin/plugin.json)) 및 마켓플레이스 규격([`.claude-plugin/marketplace.json`](file:///.claude-plugin/marketplace.json))을 갖추고 있습니다.
+Meta-Lattice는 Claude Code 공식 플러그인 규격([`.claude-plugin/plugin.json`](file:///.claude-plugin/plugin.json)) 및 마켓플레이스 규격([`.claude-plugin/marketplace.json`](file:///.claude-plugin/marketplace.json))을 갖추고 있습니다.
 
-1. **마켓플레이스를 통한 설치**:
+1. **로컬 폴더에서 마켓플레이스 등록 및 설치**:
    ```bash
-   # 1. 로컬 마켓플레이스 등록
-   claude plugin marketplace add meta-lattice ./.claude-plugin/marketplace.json
+   # 1. 압축 해제된 폴더에서 로컬 마켓플레이스 추가 (반드시 './' 경로로 입력)
+   claude plugin marketplace add ./
 
-   # 2. meta-lattice 플러그인 설치
+   # 2. meta-lattice 플러그인 설치 (플러그인 이름 지정)
    claude plugin install meta-lattice
    ```
-2. **로컬 프로젝트 플러그인으로 즉시 로드**:
+
+2. **GitHub 원격 마켓플레이스로 직접 등록 및 설치**:
    ```bash
-   # 저장소 루트에서 직접 플러그인 로드
-   claude plugin install .
+   # GitHub 저장소를 마켓플레이스로 추가 후 플러그인 설치
+   claude plugin marketplace add sleekhan/meta-lattice
+   claude plugin install meta-lattice
    ```
 
 ##### 방법 B. Meta-Lattice 자동 설치기 사용 (권장)
