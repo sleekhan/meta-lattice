@@ -1,12 +1,22 @@
 {
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/meta-lattice\" sync"
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Edit|Write",
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/meta-lattice\" audit"
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/meta-lattice\" sync && \"${CLAUDE_PLUGIN_ROOT}/meta-lattice\" audit"
           }
         ]
       }

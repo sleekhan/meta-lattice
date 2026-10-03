@@ -52,6 +52,7 @@ for target in "${TARGETS[@]}"; do
   cp "${ROOT_DIR}/${INSTALLER}" "${STAGING_DIR}/"
   [ -f "${ROOT_DIR}/AGENTS.md" ] && cp "${ROOT_DIR}/AGENTS.md" "${STAGING_DIR}/"
   [ -f "${ROOT_DIR}/GEMINI.md" ] && cp "${ROOT_DIR}/GEMINI.md" "${STAGING_DIR}/"
+  [ -f "${ROOT_DIR}/CLAUDE.md" ] && cp "${ROOT_DIR}/CLAUDE.md" "${STAGING_DIR}/"
   [ -f "${ROOT_DIR}/.mcp.json" ] && cp "${ROOT_DIR}/.mcp.json" "${STAGING_DIR}/"
 
   # Bundle native LatticeDB shared library if available
