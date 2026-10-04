@@ -21,27 +21,32 @@ import (
 )
 
 // CacheVersion is bumped whenever parsing/edge-resolution semantics change so
-// that stale caches are re-indexed automatically. 1.3: Multi-language support
-// (Java, Rust, C/C++), tsconfig path aliases, multi-module monorepos, and delta edge updates.
-const CacheVersion = "1.3"
+// that stale caches are re-indexed automatically. 1.4: Additional language
+// support (Kotlin, C#, Swift, PHP) with dotted/backslash import resolution.
+const CacheVersion = "1.4"
 
 var SupportedExtensions = map[string]string{
-	".py":   "python",
-	".ts":   "typescript",
-	".tsx":  "typescript",
-	".js":   "javascript",
-	".jsx":  "javascript",
-	".mjs":  "javascript",
-	".cjs":  "javascript",
-	".go":   "go",
-	".java": "java",
-	".rs":   "rust",
-	".c":    "c",
-	".cpp":  "cpp",
-	".cc":   "cpp",
-	".cxx":  "cpp",
-	".h":    "c",
-	".hpp":  "cpp",
+	".py":    "python",
+	".ts":    "typescript",
+	".tsx":   "typescript",
+	".js":    "javascript",
+	".jsx":   "javascript",
+	".mjs":   "javascript",
+	".cjs":   "javascript",
+	".go":    "go",
+	".java":  "java",
+	".kt":    "kotlin",
+	".kts":   "kotlin",
+	".cs":    "csharp",
+	".swift": "swift",
+	".php":   "php",
+	".rs":    "rust",
+	".c":     "c",
+	".cpp":   "cpp",
+	".cc":    "cpp",
+	".cxx":   "cpp",
+	".h":     "c",
+	".hpp":   "cpp",
 }
 
 type CacheFileInfo struct {
@@ -253,6 +258,14 @@ func (e *CacheEngine) parseFile(relPath string, absPath string, sha string) *Par
 		return ParseTSJSFile(relPath, sourceCode, sha, domain)
 	case ".java":
 		return ParseJavaFile(relPath, sourceCode, sha, domain)
+	case ".kt", ".kts":
+		return ParseKotlinFile(relPath, sourceCode, sha, domain)
+	case ".cs":
+		return ParseCSharpFile(relPath, sourceCode, sha, domain)
+	case ".swift":
+		return ParseSwiftFile(relPath, sourceCode, sha, domain)
+	case ".php":
+		return ParsePHPFile(relPath, sourceCode, sha, domain)
 	case ".rs":
 		return ParseRustFile(relPath, sourceCode, sha, domain)
 	case ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp":
@@ -688,7 +701,8 @@ func (e *CacheEngine) resolveAllCallEdges() {
 func (e *CacheEngine) resolveImportEdges(imports []ImportSpec, currentFiles map[string]string) {
 	exts := []string{
 		"", ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".go",
-		".java", ".rs", ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp",
+		".java", ".kt", ".kts", ".cs", ".swift", ".php",
+		".rs", ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp",
 		"/__init__.py", "/index.ts", "/index.tsx", "/index.js", "/mod.rs",
 	}
 
@@ -730,6 +744,9 @@ func (e *CacheEngine) resolveImportEdges(imports []ImportSpec, currentFiles map[
 		spec := imp.ModuleSpec
 		isPy := strings.HasSuffix(imp.SourceFile, ".py")
 		isJava := strings.HasSuffix(imp.SourceFile, ".java")
+		isDotLang := isJava || strings.HasSuffix(imp.SourceFile, ".kt") ||
+			strings.HasSuffix(imp.SourceFile, ".kts") || strings.HasSuffix(imp.SourceFile, ".cs")
+		isPHP := strings.HasSuffix(imp.SourceFile, ".php")
 		isRust := strings.HasSuffix(imp.SourceFile, ".rs")
 		isC := strings.HasSuffix(imp.SourceFile, ".c") || strings.HasSuffix(imp.SourceFile, ".cpp") ||
 			strings.HasSuffix(imp.SourceFile, ".cc") || strings.HasSuffix(imp.SourceFile, ".h") || strings.HasSuffix(imp.SourceFile, ".hpp")
@@ -814,10 +831,10 @@ func (e *CacheEngine) resolveImportEdges(imports []ImportSpec, currentFiles map[
 			bases = []string{base}
 		} else {
 			mod := spec
-			if isPy {
+			if isPy || isDotLang {
 				mod = strings.ReplaceAll(spec, ".", "/")
-			} else if isJava {
-				mod = strings.ReplaceAll(spec, ".", "/")
+			} else if isPHP {
+				mod = strings.ReplaceAll(strings.Trim(spec, "\\"), "\\", "/")
 			} else if isRust {
 				mod = strings.ReplaceAll(spec, "::", "/")
 				mod = strings.TrimPrefix(strings.TrimPrefix(mod, "crate/"), "super/")
@@ -1091,15 +1108,6 @@ func (e *CacheEngine) readTSConfigPaths() map[string]string {
 		}
 	}
 	return paths
-}
-
-func containsString(list []string, item string) bool {
-	for _, v := range list {
-		if v == item {
-			return true
-		}
-	}
-	return false
 }
 
 func uniqueSortedStrings(in []string) []string {

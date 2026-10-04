@@ -1,8 +1,10 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -10,6 +12,7 @@ import (
 	"meta-lattice/src/config"
 	"meta-lattice/src/features/auditor"
 	"meta-lattice/src/features/blast"
+	"meta-lattice/src/features/codegen"
 	"meta-lattice/src/features/zoomer"
 	"meta-lattice/src/indexer"
 	"meta-lattice/src/installer"
@@ -45,6 +48,10 @@ func main() {
 		runAudit(os.Args[2:])
 	case "blast":
 		runBlast(os.Args[2:])
+	case "scaffold":
+		runScaffold(os.Args[2:])
+	case "apply-plan":
+		runApplyPlan(os.Args[2:])
 	case "mcp":
 		runMCP(os.Args[2:])
 	case "install":
@@ -66,13 +73,21 @@ Usage:
 
 Commands:
   sync                     Synchronize AST cache incrementally using Git SHA / file hash caching
-                           Options: --force
+                           Options: --force, --json
   status                   Display current LatticeDB index status and graph statistics
+                           Options: --json
   zoom <action> [target]   Hierarchical Context Zoom (actions: overview, module, symbol, search)
+                           Options: --json
   audit                    Architecture Boundary Auditor: Check circular dependencies & layer violations
-                           Options: --file <path>
+                           Options: --file <path>, --json
   blast <target>           Blast Radius Estimator: Simulate ripple effects and breaking changes
-                           Options: --type <signature|body|removal|rename>, --hops <n>
+                           Options: --type <signature|body|removal|rename>, --hops <n>, --json
+  scaffold                 Code Generation: Create a new module file from a language template
+                           Options: --path <file>, --kind <class|interface|struct|enum|module>,
+                                   --name <Type>, --namespace <pkg>, --import <a,b>, --overwrite, --json
+  apply-plan               Code Generation: Apply a JSON edit plan (create/replace/insert/delete)
+                           Options: --file <plan.json> ('-' reads stdin), --execute, --json
+                           (default is --dry-run validation; pass --execute to write)
   mcp                      Start the Model Context Protocol (MCP) server over stdio
   install                  One-click installer for Claude Code, OpenAI Codex & Google Antigravity
                            Options: --claude, --codex, --antigravity, --all, --status, --uninstall
@@ -89,17 +104,50 @@ func openWorkspace(doSync bool) (*config.LatticeConfig, *storage.GraphStorage, *
 	return cfg, db, engine
 }
 
+func printJSON(v any) {
+	data, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error encoding JSON: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println(string(data))
+}
+
+// popBoolFlag extracts a `--name` switch from raw args and returns the
+// remaining args plus whether the switch was present.
+func popBoolFlag(args []string, name string) ([]string, bool) {
+	want := "--" + name
+	rest := make([]string, 0, len(args))
+	found := false
+	for _, a := range args {
+		if a == want {
+			found = true
+			continue
+		}
+		rest = append(rest, a)
+	}
+	return rest, found
+}
+
 func runSync(args []string) {
 	fs := flag.NewFlagSet("sync", flag.ExitOnError)
 	force := fs.Bool("force", false, "Force full re-indexing of all files")
+	asJSON := fs.Bool("json", false, "Print machine-readable JSON")
 	_ = fs.Parse(args)
 
 	cfg, db, engine := openWorkspace(false)
 	_ = cfg
 	_ = db
 
-	fmt.Println("Scanning and indexing workspace...")
+	if !*asJSON {
+		fmt.Println("Scanning and indexing workspace...")
+	}
 	stats := engine.Sync(*force)
+
+	if *asJSON {
+		printJSON(stats)
+		return
+	}
 
 	fmt.Println("\n=== LatticeDB Incremental Sync Complete ===")
 	fmt.Printf("• Elapsed Time:          %d ms\n", stats.ElapsedMS)
@@ -124,9 +172,22 @@ func runSync(args []string) {
 }
 
 func runStatus(args []string) {
+	rest, asJSON := popBoolFlag(args, "json")
+	_ = rest
 	_, db, engine := openWorkspace(false)
 	counts := db.CountNodesAndEdges()
 	cached := len(engine.ScanFiles())
+
+	res := map[string]any{
+		"database_engine": db.DatabaseEngine(),
+		"database_file":   db.DatabasePath(),
+		"tracked_files":   cached,
+		"counts":          counts,
+	}
+	if asJSON {
+		printJSON(res)
+		return
+	}
 
 	fmt.Println("\n=== LatticeDB Index Status ===")
 	fmt.Printf("• Database Engine:       %s\n", db.DatabaseEngine())
@@ -140,6 +201,7 @@ func runStatus(args []string) {
 }
 
 func runZoom(args []string) {
+	args, asJSON := popBoolFlag(args, "json")
 	action := "overview"
 	target := ""
 	if len(args) > 0 {
@@ -155,6 +217,10 @@ func runZoom(args []string) {
 	switch action {
 	case "overview":
 		res := z.ZoomOverview(target)
+		if asJSON {
+			printJSON(res)
+			return
+		}
 		domains, _ := res["domains"].([]map[string]any)
 		fmt.Printf("\n=== L0/L1 Architectural Overview (%d domains) ===\n", len(domains))
 		for _, d := range domains {
@@ -178,6 +244,10 @@ func runZoom(args []string) {
 			return
 		}
 		res := z.ZoomModule(target)
+		if asJSON {
+			printJSON(res)
+			return
+		}
 		if errStr, ok := res["error"].(string); ok {
 			fmt.Printf("Error: %s\n", errStr)
 			return
@@ -208,6 +278,10 @@ func runZoom(args []string) {
 			return
 		}
 		res := z.ZoomSymbol(target, "")
+		if asJSON {
+			printJSON(res)
+			return
+		}
 		if errStr, ok := res["error"].(string); ok {
 			fmt.Printf("Error: %s\n", errStr)
 			return
@@ -224,6 +298,10 @@ func runZoom(args []string) {
 			return
 		}
 		res := z.ZoomSearch(target, "", 15)
+		if asJSON {
+			printJSON(res)
+			return
+		}
 		results, _ := res["results"].([]map[string]any)
 		fmt.Printf("\n=== BM25 Search Results for '%s' (%d matches) ===\n", target, len(results))
 		for _, r := range results {
@@ -242,11 +320,17 @@ func runZoom(args []string) {
 func runAudit(args []string) {
 	fs := flag.NewFlagSet("audit", flag.ExitOnError)
 	targetFile := fs.String("file", "", "Specific file path to audit")
+	asJSON := fs.Bool("json", false, "Print machine-readable JSON")
 	_ = fs.Parse(args)
 
 	cfg, db, _ := openWorkspace(true)
 	aud := auditor.NewArchitectureBoundaryAuditor(db, cfg)
 	res := aud.CheckLayerViolation(*targetFile, nil)
+
+	if *asJSON {
+		printJSON(res)
+		return
+	}
 
 	fmt.Printf("\n=== Architecture Boundary Audit Status: %s ===\n", res["status"])
 	fmt.Printf("Target: %s\n", res["audited_target"])
@@ -274,6 +358,7 @@ func runAudit(args []string) {
 }
 
 func runBlast(args []string) {
+	args, asJSON := popBoolFlag(args, "json")
 	if len(args) == 0 {
 		fmt.Println("Error: Target symbol or path is required for 'blast'.")
 		return
@@ -298,6 +383,11 @@ func runBlast(args []string) {
 	bl := blast.NewBlastRadiusEstimator(db)
 	res := bl.EstimateBlastRadius(target, changeType, hops)
 
+	if asJSON {
+		printJSON(res)
+		return
+	}
+
 	if errStr, ok := res["error"].(string); ok {
 		fmt.Printf("Error: %s\n", errStr)
 		return
@@ -319,6 +409,123 @@ func runBlast(args []string) {
 
 	fmt.Println("\nImpact Cascade Tree:")
 	fmt.Println(res["blast_tree"])
+}
+
+func runScaffold(args []string) {
+	fs := flag.NewFlagSet("scaffold", flag.ExitOnError)
+	filePath := fs.String("path", "", "New file path relative to workspace (required)")
+	kind := fs.String("kind", "module", "class, interface, struct, enum, or module")
+	name := fs.String("name", "", "Type name (defaults to file stem)")
+	namespace := fs.String("namespace", "", "Package/namespace declaration")
+	importsCSV := fs.String("import", "", "Comma-separated module specs to import")
+	overwrite := fs.Bool("overwrite", false, "Replace an existing file")
+	asJSON := fs.Bool("json", false, "Print machine-readable JSON")
+	_ = fs.Parse(args)
+
+	if *filePath == "" {
+		fmt.Println("Error: --path is required for 'scaffold'.")
+		os.Exit(1)
+	}
+
+	var imports []string
+	for _, imp := range strings.Split(*importsCSV, ",") {
+		if imp = strings.TrimSpace(imp); imp != "" {
+			imports = append(imports, imp)
+		}
+	}
+
+	cfg, _, engine := openWorkspace(false)
+	cg := codegen.NewCodegen(cfg.WorkspaceRoot)
+	res, err := cg.ScaffoldModule(codegen.ScaffoldOptions{
+		FilePath:  *filePath,
+		Kind:      *kind,
+		Name:      *name,
+		Namespace: *namespace,
+		Imports:   imports,
+		Overwrite: *overwrite,
+	})
+	if err != nil {
+		if *asJSON {
+			printJSON(map[string]any{"error": err.Error()})
+		} else {
+			fmt.Printf("Error: %s\n", err)
+		}
+		os.Exit(1)
+	}
+
+	stats := engine.Sync(false)
+	res["sync"] = stats
+
+	if *asJSON {
+		printJSON(res)
+		return
+	}
+	fmt.Printf("\n[✓] Created %s (%s %s, %v bytes)\n", res["created"], res["language"], res["kind"], res["bytes"])
+	fmt.Println("Indexed. Verify with: ./meta-lattice zoom module", res["created"])
+}
+
+func runApplyPlan(args []string) {
+	fs := flag.NewFlagSet("apply-plan", flag.ExitOnError)
+	planFile := fs.String("file", "", "JSON plan file with {\"operations\": [...]} ('-' reads stdin)")
+	execute := fs.Bool("execute", false, "Write changes (default is dry-run validation)")
+	asJSON := fs.Bool("json", false, "Print machine-readable JSON")
+	_ = fs.Parse(args)
+
+	if *planFile == "" {
+		fmt.Println("Error: --file is required for 'apply-plan'.")
+		os.Exit(1)
+	}
+
+	var data []byte
+	var err error
+	if *planFile == "-" {
+		data, err = io.ReadAll(os.Stdin)
+	} else {
+		data, err = os.ReadFile(*planFile)
+	}
+	if err != nil {
+		fmt.Printf("Error: cannot read plan: %s\n", err)
+		os.Exit(1)
+	}
+
+	var plan struct {
+		Operations []codegen.PlanOperation `json:"operations"`
+	}
+	if err := json.Unmarshal(data, &plan); err != nil {
+		// Also accept a bare operations array.
+		var bare []codegen.PlanOperation
+		if err2 := json.Unmarshal(data, &bare); err2 != nil {
+			fmt.Printf("Error: invalid plan JSON: %s\n", err)
+			os.Exit(1)
+		}
+		plan.Operations = bare
+	}
+
+	cfg, _, engine := openWorkspace(false)
+	cg := codegen.NewCodegen(cfg.WorkspaceRoot)
+	res, err := cg.ApplyPlan(plan.Operations, !*execute)
+	if err == nil && *execute {
+		stats := engine.Sync(false)
+		res["sync"] = stats
+	}
+	if err != nil {
+		if *asJSON {
+			printJSON(res)
+		} else {
+			fmt.Printf("Error: %s (rolled back)\n", res["error"])
+		}
+		os.Exit(1)
+	}
+
+	if *asJSON {
+		printJSON(res)
+		return
+	}
+	if !*execute {
+		fmt.Printf("\n[✓] Dry run OK: %v operation(s) validated, no files modified. Re-run with --execute to apply.\n", res["applied"])
+		return
+	}
+	fmt.Printf("\n[✓] Applied %v operation(s) and re-indexed.\n", res["applied"])
 }
 
 func runMCP(args []string) {

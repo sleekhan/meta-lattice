@@ -12,6 +12,7 @@ import (
 	"meta-lattice/src/config"
 	"meta-lattice/src/features/auditor"
 	"meta-lattice/src/features/blast"
+	"meta-lattice/src/features/codegen"
 	"meta-lattice/src/features/zoomer"
 	"meta-lattice/src/indexer"
 	"meta-lattice/src/storage"
@@ -45,6 +46,7 @@ type MCPServer struct {
 	zoomer      *zoomer.HierarchicalZoomer
 	auditor     *auditor.ArchitectureBoundaryAuditor
 	blast       *blast.BlastRadiusEstimator
+	codegen     *codegen.Codegen
 }
 
 func NewMCPServer(workspaceRoot string) *MCPServer {
@@ -54,6 +56,7 @@ func NewMCPServer(workspaceRoot string) *MCPServer {
 	z := zoomer.NewHierarchicalZoomer(db)
 	aud := auditor.NewArchitectureBoundaryAuditor(db, cfg)
 	bl := blast.NewBlastRadiusEstimator(db)
+	cg := codegen.NewCodegen(cfg.WorkspaceRoot)
 
 	return &MCPServer{
 		cfg:         cfg,
@@ -62,6 +65,7 @@ func NewMCPServer(workspaceRoot string) *MCPServer {
 		zoomer:      z,
 		auditor:     aud,
 		blast:       bl,
+		codegen:     cg,
 	}
 }
 
@@ -131,7 +135,7 @@ func (s *MCPServer) handleRequest(req *JSONRPCRequest) *JSONRPCResponse {
 					"name":    "meta-lattice",
 					"version": "1.0.0",
 				},
-				"instructions": "Meta-Lattice provides Hierarchical Context Zooming (L0->L3), Architecture Boundary Auditing, Blast Radius Estimation, and Incremental AST Caching for Claude Code using LatticeDB.",
+				"instructions": "Meta-Lattice provides Hierarchical Context Zooming (L0->L3), Architecture Boundary Auditing, Blast Radius Estimation, Incremental AST Caching, and Code Generation (scaffold_module, apply_plan with dry_run and rollback) for Claude Code using LatticeDB.",
 			},
 		}
 
@@ -300,6 +304,34 @@ func (s *MCPServer) listTools() []map[string]any {
 				"type": "object",
 			},
 		},
+		{
+			"name":        "scaffold_module",
+			"description": "Code Generation: Create a new source file from a per-language template (class, interface, struct, enum, module). Refuses to overwrite unless asked; paths are confined to the workspace.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"file_path": map[string]any{"type": "string", "description": "New file path relative to workspace"},
+					"kind":      map[string]any{"type": "string", "description": "class, interface, struct, enum, or module"},
+					"name":      map[string]any{"type": "string", "description": "Type name (defaults to file stem)"},
+					"namespace": map[string]any{"type": "string", "description": "Package/namespace declaration"},
+					"imports":   map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Module specs to import"},
+					"overwrite": map[string]any{"type": "boolean", "description": "Replace an existing file"},
+				},
+				"required": []string{"file_path"},
+			},
+		},
+		{
+			"name":        "apply_plan",
+			"description": "Code Generation: Apply a batch of file edits (create_file, replace_text, insert_after, delete_file) with validation, dry_run support, and automatic rollback on failure. Always dry_run first for multi-file edits.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"operations": map[string]any{"type": "array", "description": "Ordered edit operations", "items": map[string]any{"type": "object"}},
+					"dry_run":    map[string]any{"type": "boolean", "description": "Validate without writing (default: true for safety)"},
+				},
+				"required": []string{"operations"},
+			},
+		},
 	}
 }
 
@@ -388,6 +420,70 @@ func (s *MCPServer) callTool(name string, args map[string]any) (string, error) {
 			"db_path":             s.db.DatabasePath(),
 			"counts":              counts,
 			"cached_files":        cachedCount,
+		}
+		data, err := json.MarshalIndent(res, "", "  ")
+		return string(data), err
+
+	case "scaffold_module":
+		filePath, _ := args["file_path"].(string)
+		kind, _ := args["kind"].(string)
+		name, _ := args["name"].(string)
+		namespace, _ := args["namespace"].(string)
+		overwrite, _ := args["overwrite"].(bool)
+		var imports []string
+		if raw, ok := args["imports"].([]any); ok {
+			for _, it := range raw {
+				if str, ok := it.(string); ok {
+					imports = append(imports, str)
+				}
+			}
+		}
+		res, err := s.codegen.ScaffoldModule(codegen.ScaffoldOptions{
+			FilePath:  filePath,
+			Kind:      kind,
+			Name:      name,
+			Namespace: namespace,
+			Imports:   imports,
+			Overwrite: overwrite,
+		})
+		if err != nil {
+			return "", err
+		}
+		stats := s.cacheEngine.Sync(false)
+		res["sync"] = stats
+		data, err := json.MarshalIndent(res, "", "  ")
+		return string(data), err
+
+	case "apply_plan":
+		rawOps, _ := args["operations"].([]any)
+		var ops []codegen.PlanOperation
+		for _, raw := range rawOps {
+			var op codegen.PlanOperation
+			blob, err := json.Marshal(raw)
+			if err != nil {
+				return "", fmt.Errorf("invalid operation: %v", err)
+			}
+			if err := json.Unmarshal(blob, &op); err != nil {
+				return "", fmt.Errorf("invalid operation: %v", err)
+			}
+			ops = append(ops, op)
+		}
+		// Safety default: validate only unless the caller explicitly opts in.
+		dryRun := true
+		if dr, ok := args["dry_run"].(bool); ok {
+			dryRun = dr
+		}
+		res, err := s.codegen.ApplyPlan(ops, dryRun)
+		if err != nil {
+			blob, _ := json.MarshalIndent(res, "", "  ")
+			if blob != nil {
+				return string(blob), err
+			}
+			return "", err
+		}
+		if !dryRun {
+			stats := s.cacheEngine.Sync(false)
+			res["sync"] = stats
 		}
 		data, err := json.MarshalIndent(res, "", "  ")
 		return string(data), err

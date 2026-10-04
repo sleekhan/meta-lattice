@@ -33,7 +33,7 @@
 - **공식 LatticeDB 단일 파일 그래프 데이터베이스 탑재**: 공식 `github.com/jeffhajewski/latticedb/bindings/go`를 통해 `.lattice/knowledge.lattice` 단일 바이너리 파일로 L0~L3 지식 그래프 및 엣지 관계를 관리하며, 고속 조회를 위한 B-Tree 프로퍼티 인덱스를 자동 생성합니다.
 - **배포 아티팩트 내 네이티브 라이브러리 자동 번들링**: 릴리스 아카이브 내에 `liblattice` 동적 라이브러리와 RPATH(`@executable_path`, `$ORIGIN`)가 사전 구성되어 별도의 시스템 라이브러리 설치 없이 즉시 구동됩니다.
 - **대규모 프로젝트 최적화 멀티코어 병렬 파싱**: `runtime.GOMAXPROCS(0)` 기반 워커 풀(Worker Pool)을 적용하여 수천~수만 개의 대규모 프로젝트 파일도 CPU 코어 수에 맞추어 초고속 병렬 파싱합니다.
-- **엔터프라이즈 멀티 랭귀지 AST 파서 내장**: **Go**(`go/ast`, `go/parser`), **Python**, **TypeScript/JavaScript**, **Java**(`.java`), **Rust**(`.rs`), **C/C++**(`.c`, `.cpp`, `.cc`, `.cxx`, `.h`, `.hpp`) 소스 코드를 네이티브 파싱하여 심볼, 시그니처, 클래스, 호출 그래프를 추출합니다.
+- **엔터프라이즈 멀티 랭귀지 AST 파서 내장**: **Go**(`go/ast`, `go/parser`), **Python**, **TypeScript/JavaScript**, **Java**, **Kotlin**(`.kt`, `.kts`), **C#**(`.cs`), **Swift**(`.swift`), **PHP**(`.php`), **Rust**(`.rs`), **C/C++**(`.c`, `.cpp`, `.cc`, `.cxx`, `.h`, `.hpp`) 소스 코드를 네이티브 파싱하여 심볼, 시그니처, 클래스, 호출 그래프를 추출합니다.
 - **모노레포(Monorepo) 경로 매핑 지원**: TypeScript `tsconfig.json`의 경로 별칭(`@/*`, `~/*`) 및 모노레포 내 하위 디렉터리의 다중 `go.mod` 모듈 경로를 자동 감지하여 정확한 상호 파일 의존성 엣지를 구축합니다.
 - **MCP (Model Context Protocol) 서버 내장**: `stdio` 기반 JSON-RPC 2.0 로 MCP(protocolVersion `2024-11-05`, `tools` 기능)를 구현하여 Codex, Antigravity, Claude Code에서 사용할 수 있습니다.
 
@@ -73,15 +73,48 @@
 #### 인덱싱 제외 규칙
 * **디렉터리 이름 패턴** (`.git`, `node_modules`, `dist`, `build`, `out`, `bin`, `target`, `obj`, `ref`, `venv` 등)은 **디렉터리에만** 적용됩니다. 따라서 `out.py`, `ref.go` 같은 파일은 정상적으로 인덱싱됩니다.
 * **파일 패턴** (`*.min.js`, `*.bundle.js`, `*.map`, `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`)은 파일에 적용됩니다.
+* **워크스페이스 커스텀 제외 (`.latticeignore`)**: 저장소 루트에 `.latticeignore` 파일을 두면 한 줄당 하나의 glob 패턴(빈 줄·`#` 주석 무시, 중복 자동 제거)이 기본 제외 목록에 추가됩니다. 생성 코드·벤더 트리·스냅샷 등 대규모 모노레포 전용 제외에 사용하세요.
 * 무시 규칙을 바꾼 뒤에는 `./meta-lattice sync --force`로 인덱스를 다시 만드세요.
 
 ---
 
 ## 🛠 빌드 및 크로스 컴파일 (Building & Cross-Compilation)
 
-Go 표준 툴체인을 통해 외부 SDK나 환경 설정 없이 단일 바이너리로 컴파일할 수 있습니다.
+**Docker-first**: 호스트에 Go/CGO 툴체인이 없어도 됩니다. `scripts/docker-build.sh`가 호스트 소스를 컨테이너(`/work`)에 바인드 마운트하여 재현 가능한 Go 툴체인으로 빌드합니다.
 
-### 1. 네이티브 바이너리 빌드 (macOS / Linux)
+```bash
+# 빌더 이미지 준비 (최초 1회; 이후 자동 재사용)
+make docker-builder
+
+# 호스트 플랫폼용 바이너리 (Docker, 이식형 내장 엔진)
+make build          # meta-lattice
+make windows        # meta-lattice.exe (windows/amd64)
+make test           # 회귀 테스트 (Docker)
+make package        # 전 플랫폼 릴리스 아카이브 (dist/, Docker)
+
+# 호스트 툴체인 직접 빌드 (Go + C 컴파일러 필요, DOCKER=0)
+make build DOCKER=0       # macOS/Linux: 네이티브 LatticeDB 연동
+make test DOCKER=0
+```
+
+### 빌드 매트릭스: 네이티브 LatticeDB vs 내장 툴백 엔진
+
+| 빌드 경로 | CGO | 사용 엔진 (`status` 확인) | 비고 |
+| :--- | :---: | :--- | :--- |
+| `make build` (Docker, macOS/Windows host) | OFF (`-tags nolattice`) | Embedded Go Property-Graph | 즉시 실행, 추가 설정 불필요 |
+| `make build DOCKER=0` (macOS/Linux host) | ON | LatticeDB v0.15.0 | `deps/latticedb` 네이티브 lib 필요 |
+| `./scripts/docker-build.sh native-linux [ARCH]` | ON | LatticeDB v0.15.0 | linux 전용, 컨테이너 아키텍처와 일치해야 함 |
+| `make package` / `build-release.sh` (기본) | OFF | Embedded Go Property-Graph | 전 타깃 이식형. `USE_NATIVE=1` 지정 시 컨테이너 아키텍처와 같은 linux 타깃만 CGO 빌드 |
+
+```bash
+# 예: linux/arm64 네이티브 CGO 빌드 (liblattice.so 동봉)
+./scripts/docker-build.sh native-linux arm64 ./meta-lattice-linux-arm64
+
+# 예: 릴리스 (Docker + 가능한 linux 타깃만 네이티브)
+USE_DOCKER=1 USE_NATIVE=1 ./scripts/build-release.sh v1.1.0
+```
+
+### 1. 네이티브 바이너리 빌드 (macOS / Linux, 호스트 툴체인)
 ```bash
 # 네이티브 빌드
 go build -ldflags="-s -w" -o meta-lattice ./src
@@ -102,11 +135,17 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 
 ### 3. Makefile 사용 (빌드 및 패키징)
 ```bash
-make build       # 네이티브 바이너리 빌드 (meta-lattice)
-make windows     # 윈도우 x86 64-bit 바이너리 빌드 (meta-lattice.exe)
-make build-all   # 네이티브 및 윈도우 바이너리 동시 빌드
-make package     # 전 플랫폼(Windows, Linux, macOS) 릴리스 압축 아카이브 생성 (dist/)
-make test        # 단위/회귀 테스트 실행
+make build       # 호스트 바이너리 빌드 (meta-lattice, Docker 기본)
+make windows     # 윈도우 x86 64-bit 바이너리 빌드 (meta-lattice.exe, Docker 기본)
+make build-all   # 호스트 및 윈도우 바이너리 동시 빌드
+make package     # 전 플랫폼(Windows, Linux, macOS) 릴리스 압축 아카이브 생성 (dist/, Docker 기본)
+make test        # 단위/회귀 테스트 실행 (Docker 기본)
+make docker-builder  # Docker Go 툴체인 이미지 (재)빌드
+make docker-shell    # 빌더 컨테이너 대화형 셸
+
+# 호스트 Go 툴체인으로 직접 빌드하려면 DOCKER=0
+make build DOCKER=0
+make test DOCKER=0
 ```
 
 ### 4. GitHub Actions 릴리스 & 자동 배포 (Release & Publish)
@@ -191,11 +230,13 @@ Meta-Lattice는 Claude Code 공식 플러그인 규격([`.claude-plugin/plugin.j
 ./meta-lattice install --claude
 ```
 - **글로벌 MCP 등록**: `~/.claude.json`의 `mcpServers.meta-lattice`에 바이너리 경로가 자동 추가됩니다.
-- **슬래시 커맨드 자동 배포**: `~/.claude/commands/`에 아래 4대 커맨드가 즉시 배치되어 대화 중 `/`를 눌러 바로 호출할 수 있습니다.
+- **슬래시 커맨드 자동 배포**: `~/.claude/commands/`에 아래 6대 커맨드가 즉시 배치되어 대화 중 `/`를 눌러 바로 호출할 수 있습니다.
   - `/zoom`: 계층적 컨텍스트 탐색 (L0 도메인 -> L3 심볼 구현)
   - `/audit`: 단방향 레이어 아키텍처 및 순환 참조 감사
   - `/blast`: 변경 전 파급 영향도(Blast Score) 시뮬레이션
   - `/sync`: 증분 AST 캐시 동기화
+  - `/scaffold`: 언어별 템플릿 신규 모듈 생성
+  - `/apply`: 파일 편집 배치 적용 (dry-run 검증 + 롤백)
 
 ##### 방법 C. Claude Code CLI로 직접 MCP 등록
 ```bash
@@ -254,14 +295,14 @@ Codex는 프로젝트 루트의 [`AGENTS.md`](file:///AGENTS.md)를 자동으로
 
 #### 🔵 Google Antigravity 설치 및 연동 (CLI & IDE)
 
-Google Antigravity(IDE 및 CLI) 환경에서는 MCP 서버 연동과 더불어 **4대 에이전트 스킬(Skills)**, **운영 규칙(GEMINI.md)**, **자동 훅(Hooks)**을 통합 구성합니다.
+Google Antigravity(IDE 및 CLI) 환경에서는 MCP 서버 연동과 더불어 **5대 에이전트 스킬(Skills)**, **운영 규칙(GEMINI.md)**, **자동 훅(Hooks)**을 통합 구성합니다.
 
 ##### 방법 A. Meta-Lattice 자동 설치기 사용 (권장)
 ```bash
 ./meta-lattice install --antigravity
 ```
 - **MCP 서버 등록**: `~/.gemini/config/mcp_config.json`에 `meta-lattice` 서버를 자동 등록합니다.
-- **4대 에이전트 스킬 자동 배포**: `~/.gemini/config/skills/`에 스킬 매니페스트([`SKILL.md`](file:///skills/hierarchical-zoom/SKILL.md))를 자동 생성하여 Antigravity가 작업 상황에 맞춰 자율적으로 도구를 선택할 수 있게 합니다.
+- **5대 에이전트 스킬 자동 배포**: `~/.gemini/config/skills/`에 스킬 매니페스트([`SKILL.md`](file:///skills/hierarchical-zoom/SKILL.md))를 자동 생성하여 Antigravity가 작업 상황에 맞춰 자율적으로 도구를 선택할 수 있게 합니다.
 
 ##### 방법 B. 글로벌 수동 설정 (`~/.gemini/config/mcp_config.json`)
 ```json
@@ -340,11 +381,20 @@ Google Antigravity(IDE 및 CLI) 환경에서는 MCP 서버 연동과 더불어 *
 # 5. 변경 파급 영향도 시뮬레이션
 ./meta-lattice blast EstimateBlastRadius --type signature --hops 4
 
+# 5b. 코드 생성 (스캐폴드 & 편집 플랜)
+./meta-lattice scaffold --path svc/user_service.py --kind class --name UserService
+./meta-lattice apply-plan --file plan.json            # dry-run 검증 (쓰기 없음)
+./meta-lattice apply-plan --file plan.json --execute  # 실제 적용 (실패 시 롤백)
+
 # 6. MCP 서버 구동 (stdio)
 ./meta-lattice mcp
 
 # 7. 플랫폼 설치 상태 확인
 ./meta-lattice install --status
+
+# 기계 판독 출력이 필요하면 --json (sync, status, zoom, audit, blast, scaffold, apply-plan)
+./meta-lattice zoom search BlastRadius --json
+./meta-lattice audit --json
 ```
 
 ---
@@ -361,6 +411,8 @@ Google Antigravity(IDE 및 CLI) 환경에서는 MCP 서버 연동과 더불어 *
 | `estimate_blast_radius` | `symbol_or_path: string, change_type?: string` | 변경 파급 영향도(Blast Score) 및 Top 10 파괴적 변경 지점 브리핑 |
 | `sync_index` | `force?: bool` | 고속 증분 인덱스 동기화 |
 | `get_index_status` | 없음 | 노드/엣지 현황 및 캐시 통계 확인 |
+| `scaffold_module` | `file_path: string, kind?: string, name?: string, namespace?: string, imports?: string[], overwrite?: bool` | 코드 생성: 언어별 템플릿으로 신규 소스 파일 생성 (워크스페이스 한정, 기본 덮어쓰기 거부) |
+| `apply_plan` | `operations: array, dry_run?: bool` | 코드 생성: 파일 편집 배치 적용 (`create_file`, `replace_text`, `insert_after`, `delete_file`), dry-run 검증 및 실패 시 자동 롤백 |
 
 ---
 

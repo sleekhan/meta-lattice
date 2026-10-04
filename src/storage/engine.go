@@ -57,7 +57,17 @@ func NewGraphStorage(storagePath string) *GraphStorage {
 		if os.IsPermission(err) {
 			return gs
 		}
-		_ = os.Rename(storagePath, storagePath+".corrupt")
+		// Preserve the file that actually failed to load. In native mode
+		// that is the .lattice file when present, otherwise the JSON
+		// fallback; in pure-Go (CGO-disabled) mode it is always the JSON
+		// file. Renaming the wrong path silently skipped recovery there.
+		corruptPath := storagePath
+		if !HasNativeLatticeDB {
+			corruptPath = jsonPath
+		} else if _, statErr := os.Stat(latticePath); os.IsNotExist(statErr) {
+			corruptPath = jsonPath
+		}
+		_ = os.Rename(corruptPath, corruptPath+".corrupt")
 	}
 	return gs
 }
@@ -312,12 +322,6 @@ func (s *GraphStorage) deleteEdgeLocked(sourceID, targetID, edgeType string) {
 		}
 		s.inEdges[targetID] = updated
 	}
-}
-
-func (s *GraphStorage) DeleteEdge(sourceID, targetID, edgeType string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.deleteEdgeLocked(sourceID, targetID, edgeType)
 }
 
 func (s *GraphStorage) DeleteEdgesByType(edgeTypes ...string) {

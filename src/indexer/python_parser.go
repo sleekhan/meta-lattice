@@ -168,6 +168,12 @@ func extractCallsFromLines(bodyLines []string, callerID string, baseLine int) []
 		if strings.HasPrefix(trimmed, "#") {
 			continue
 		}
+		// Nested definitions belong to the inner symbol; their names must
+		// not be recorded as calls of the enclosing function.
+		if strings.HasPrefix(trimmed, "def ") || strings.HasPrefix(trimmed, "async def ") ||
+			strings.HasPrefix(trimmed, "class ") {
+			continue
+		}
 
 		// Direct calls
 		matches := pyCallRegex.FindAllStringSubmatch(l, -1)

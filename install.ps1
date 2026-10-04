@@ -10,8 +10,12 @@ if (-not (Test-Path $BinPath)) {
         $env:GOOS = "windows"
         $env:GOARCH = "amd64"
         go build -ldflags="-s -w" -o $BinPath "$ScriptDir\src"
+    } elseif (Get-Command docker -ErrorAction SilentlyContinue) {
+        Write-Host "    'go' not found; building host source inside Docker..."
+        & "$ScriptDir\scripts\docker-build.sh" windows $BinPath
+        if (-not (Test-Path $BinPath)) { exit 1 }
     } else {
-        Write-Error "Error: 'go' was not found in PATH and precompiled 'meta-lattice.exe' does not exist."
+        Write-Error "Error: neither 'go' nor 'docker' was found and precompiled 'meta-lattice.exe' does not exist."
         exit 1
     }
 }

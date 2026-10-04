@@ -15,6 +15,10 @@ var (
 	javaTypeDeclRegex = regexp.MustCompile(`(?m)(?:public|protected|private|abstract|final|static|\s)*\b(class|interface|enum|record)\s+([a-zA-Z0-9_]+)(?:<[^>]+>)?(?:\s+extends\s+[a-zA-Z0-9_<>.,\s]+)?(?:\s+implements\s+[a-zA-Z0-9_<>.,\s]+)?`)
 	javaMethodRegex   = regexp.MustCompile(`(?m)(?:(?:public|protected|private|static|final|abstract|synchronized|native|default)\s+)+([a-zA-Z0-9_<>[\].,\s]+)\s+([a-zA-Z0-9_]+)\s*\(([^)]*)\)\s*(?:throws\s+[a-zA-Z0-9_,\s]+)?\s*\{?`)
 	javaCallRegex     = regexp.MustCompile(`\b([a-zA-Z0-9_]+)\s*\(`)
+	javaKeywordCalls  = map[string]bool{
+		"if": true, "for": true, "while": true, "switch": true, "catch": true,
+		"return": true, "new": true, "throw": true,
+	}
 )
 
 func ParseJavaFile(relPath string, code string, sha string, domain string) *ParsedFileResult {
@@ -96,7 +100,7 @@ func ParseJavaFile(relPath string, code string, sha string, domain string) *Pars
 			params := strings.TrimSpace(m[3])
 
 			// Skip keywords that look like method calls
-			if methodName == "if" || methodName == "for" || methodName == "while" || methodName == "switch" || methodName == "catch" {
+			if javaKeywordCalls[methodName] {
 				continue
 			}
 
@@ -112,38 +116,20 @@ func ParseJavaFile(relPath string, code string, sha string, domain string) *Pars
 				parentID = currentClassID
 			}
 
-			// Estimate body & complexity
-			complexity := 1
-			bodyLines := []string{line}
+			// Estimate body & complexity with brace-depth termination so
+			// one-line bodies and declarations can't leak into siblings.
+			bodyLines, foundCalls, complexity := scanBody(lines, lineNum, 150, javaCallRegex,
+				javaKeywordCalls, methodName,
+				[]string{"if ", "for ", "while ", "case ", "catch "},
+				[]string{" && ", " || "}, javaMethodRegex)
 			var methodCalls []string
-
-			for i := lineNum + 1; i < len(lines) && i < lineNum+150; i++ {
-				subLine := lines[i]
-				bodyLines = append(bodyLines, subLine)
-				subTrim := strings.TrimSpace(subLine)
-
-				if strings.HasPrefix(subTrim, "if ") || strings.HasPrefix(subTrim, "for ") ||
-					strings.HasPrefix(subTrim, "while ") || strings.HasPrefix(subTrim, "case ") ||
-					strings.HasPrefix(subTrim, "catch ") || strings.Contains(subTrim, " && ") ||
-					strings.Contains(subTrim, " || ") {
-					complexity++
-				}
-
-				for _, cm := range javaCallRegex.FindAllStringSubmatch(subLine, -1) {
-					cName := cm[1]
-					if cName != "if" && cName != "for" && cName != "while" && cName != "switch" && cName != "catch" && cName != methodName {
-						methodCalls = append(methodCalls, cName)
-						calls = append(calls, CallSpec{
-							CallerID:   symID,
-							CalledName: cName,
-							LineNumber: i + 1,
-						})
-					}
-				}
-
-				if strings.Contains(subLine, "}") && !strings.Contains(subLine, "{") {
-					break
-				}
+			for _, bc := range foundCalls {
+				methodCalls = append(methodCalls, bc.Name)
+				calls = append(calls, CallSpec{
+					CallerID:   symID,
+					CalledName: bc.Name,
+					LineNumber: bc.Line,
+				})
 			}
 
 			symbolNodes = append(symbolNodes, models.L3SymbolNode{
@@ -166,6 +152,7 @@ func ParseJavaFile(relPath string, code string, sha string, domain string) *Pars
 	}
 
 	fileNode.Exports = exports
+	fillMethodSignatures(&classNodes, symbolNodes)
 
 	return &ParsedFileResult{
 		FileNode:    fileNode,

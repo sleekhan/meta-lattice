@@ -14,6 +14,8 @@ The `meta-lattice` MCP server provides the following tools:
 6. **`estimate_blast_radius(symbol_or_path, change_type="signature")`**: Simulates ripple effects and calculates a Blast Score (0-100) with Top 10 breaking change points.
 7. **`sync_index(force=False)`**: Synchronizes the AST cache with workspace changes.
 8. **`get_index_status()`**: Inspects graph statistics (L0, L1, L2, L3 counts).
+9. **`scaffold_module(file_path, kind, name=None)`**: Creates a new source file from a language template. Workspace-confined, no overwrite by default.
+10. **`apply_plan(operations, dry_run=True)`**: Applies batched file edits with validation and automatic rollback. ALWAYS dry_run first for multi-file edits.
 
 ## 🧭 Operating Rules for Claude Code
 

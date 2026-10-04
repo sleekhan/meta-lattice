@@ -330,15 +330,3 @@ func ParseGoFile(filePath string, sourceCode string, sha string, domain string) 
 		Calls:       allCalls,
 	}
 }
-
-func uniqueStrings(in []string) []string {
-	seen := make(map[string]bool, len(in))
-	var out []string
-	for _, s := range in {
-		if !seen[s] && s != "" {
-			seen[s] = true
-			out = append(out, s)
-		}
-	}
-	return out
-}

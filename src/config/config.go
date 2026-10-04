@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 var DefaultIgnorePatterns = []string{
@@ -97,12 +98,38 @@ func NewLatticeConfig(workspaceRoot string) *LatticeConfig {
 		IgnorePatterns: append([]string(nil), DefaultIgnorePatterns...),
 		ArchRules:      DefaultArchRules(),
 	}
+	cfg.loadLatticeIgnore()
 	cfg.loadArchConfig()
 	return cfg
 }
 
 func (c *LatticeConfig) EnsureDirectories() error {
 	return os.MkdirAll(c.CacheDir, 0755)
+}
+
+// loadLatticeIgnore appends workspace-local ignore rules from
+// <workspace>/.latticeignore (one glob per line, '#' comments and blank
+// lines ignored), so large monorepos can exclude generated code, vendored
+// trees, or snapshots without touching the built-in defaults.
+func (c *LatticeConfig) loadLatticeIgnore() {
+	data, err := os.ReadFile(filepath.Join(c.WorkspaceRoot, ".latticeignore"))
+	if err != nil {
+		return
+	}
+	seen := make(map[string]bool, len(c.IgnorePatterns))
+	for _, p := range c.IgnorePatterns {
+		seen[p] = true
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		pattern := strings.TrimSpace(line)
+		if pattern == "" || strings.HasPrefix(pattern, "#") {
+			continue
+		}
+		if !seen[pattern] {
+			seen[pattern] = true
+			c.IgnorePatterns = append(c.IgnorePatterns, pattern)
+		}
+	}
 }
 
 func (c *LatticeConfig) loadArchConfig() {

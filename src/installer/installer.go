@@ -58,6 +58,19 @@ Use 'sync_index' to refresh AST and graph edges after modifying source files:
 - Ultra-fast incremental sync using SHA-256 and mtime
 - Rebuilds cross-file IMPORTS and CALLS edges
 `,
+	"codegen": `---
+name: codegen
+description: Scaffolds new modules and applies multi-file edit plans with dry-run and rollback using Meta-Lattice
+---
+
+# Code Generation
+
+Use 'scaffold_module' to create new source files from language templates,
+and 'apply_plan' for batched edits:
+- scaffold_module: kind class|interface|struct|enum|module, workspace-confined, no overwrite by default
+- apply_plan: create_file, replace_text, insert_after, delete_file; dry_run first, rollback on failure
+- After writing: 'sync_index', then 'check_layer_violation' on touched files
+`,
 }
 
 var CommandTemplates = map[string]string{
@@ -108,6 +121,30 @@ usage: /sync [--force]
 Use Meta-Lattice MCP tool 'sync_index':
 - Ultra-fast incremental sync using file SHA-256 and mtime
 - Rebuilds cross-file IMPORTS and CALLS edges
+`,
+	"scaffold": `---
+description: Generate a new source file from a per-language template (class, interface, struct, enum, module).
+usage: /scaffold <file_path> [--kind <class|interface|struct|enum|module>] [--name <Type>]
+---
+
+# Code Generation - Scaffold Module
+
+Use Meta-Lattice MCP tool 'scaffold_module':
+- Creates Kotlin, C#, Swift, PHP, Go, Python, TS/JS, Java, Rust, C/C++ skeletons
+- Refuses to overwrite unless 'overwrite' is true; paths stay inside the workspace
+- Follow with 'sync_index', then 'zoom_module' to verify the new file
+`,
+	"apply": `---
+description: Apply a batch of file edits with dry-run validation and automatic rollback.
+usage: /apply <plan.json> [--execute]
+---
+
+# Code Generation - Apply Edit Plan
+
+Use Meta-Lattice MCP tool 'apply_plan':
+- Ops: create_file, replace_text, insert_after, delete_file
+- ALWAYS dry_run first for multi-file edits; re-run with dry_run=false to write
+- On failure all applied ops roll back; then run 'sync_index' and 'check_layer_violation'
 `,
 }
 

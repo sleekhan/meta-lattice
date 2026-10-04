@@ -39,7 +39,9 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          # go.mod tracks a recent toolchain (1.27.x); 'stable' follows it so
+          # GOTOOLCHAIN auto-upgrade always has a new enough base to start from.
+          go-version: 'stable'
           cache: false
 
       - name: Determine Version

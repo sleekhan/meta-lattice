@@ -15,7 +15,17 @@ var (
 	tsFuncRegex   = regexp.MustCompile(`(?m)^\s*(?:export\s+)?(?:async\s+)?function\s+([a-zA-Z0-9_]+)\s*\(`)
 	tsArrowRegex  = regexp.MustCompile(`(?m)^\s*(?:export\s+)?(?:const|let|var)\s+([a-zA-Z0-9_]+)\s*=\s*(?:async\s+)?\([^)]*\)\s*(?::\s*[^=]+)?=>`)
 	tsCallRegex   = regexp.MustCompile(`([a-zA-Z0-9_]+)\s*\(`)
+	tsKeywordCalls = map[string]bool{
+		"if": true, "for": true, "while": true, "switch": true, "catch": true,
+		"return": true, "new": true, "typeof": true,
+	}
 )
+
+// tsNestedDef reports lines that open a nested named function, whose own
+// name must not be recorded as a call of the enclosing symbol.
+func tsNestedDef(trimmed string) bool {
+	return strings.Contains(trimmed, "function ")
+}
 
 func computeTSComplexity(lines []string) int {
 	complexity := 1
@@ -175,18 +185,8 @@ func ParseTSJSFile(filePath string, sourceCode string, sha string, domain string
 									methodCode := strings.Join(methodLines, "\n")
 									complexity := computeTSComplexity(methodLines)
 
-									var calls []string
-									callMatches := tsCallRegex.FindAllStringSubmatch(methodCode, -1)
-									for _, cm := range callMatches {
-										if len(cm) > 1 && cm[1] != methodName && cm[1] != "if" && cm[1] != "for" && cm[1] != "while" {
-											calls = append(calls, cm[1])
-											allCalls = append(allCalls, CallSpec{
-												CallerID:   methodID,
-												CalledName: cm[1],
-												LineNumber: methodStartLine,
-											})
-										}
-									}
+									methodSpecs, calls := extractBraceCalls(methodLines, methodStartLine, methodID, methodName, tsCallRegex, tsKeywordCalls, tsNestedDef, len(methodLines) > 1)
+									allCalls = append(allCalls, methodSpecs...)
 
 									symbolNodes = append(symbolNodes, models.L3SymbolNode{
 										ID:                   methodID,
@@ -341,18 +341,8 @@ func ParseTSJSFile(filePath string, sourceCode string, sha string, domain string
 				codeSlice := strings.Join(funcLines, "\n")
 				complexity := computeTSComplexity(funcLines)
 
-				var calls []string
-				callMatches := tsCallRegex.FindAllStringSubmatch(codeSlice, -1)
-				for _, cm := range callMatches {
-					if len(cm) > 1 && cm[1] != funcName && cm[1] != "if" && cm[1] != "for" && cm[1] != "while" {
-						calls = append(calls, cm[1])
-						allCalls = append(allCalls, CallSpec{
-							CallerID:   funcID,
-							CalledName: cm[1],
-							LineNumber: funcStartLine,
-						})
-					}
-				}
+				funcSpecs, calls := extractBraceCalls(funcLines, funcStartLine, funcID, funcName, tsCallRegex, tsKeywordCalls, tsNestedDef, len(funcLines) > 1)
+				allCalls = append(allCalls, funcSpecs...)
 
 				symbolNodes = append(symbolNodes, models.L3SymbolNode{
 					ID:                   funcID,
@@ -426,18 +416,11 @@ func ParseTSJSFile(filePath string, sourceCode string, sha string, domain string
 				}
 
 				complexity := 1
-				var calls []string
-				callMatches := tsCallRegex.FindAllStringSubmatch(codeSlice, -1)
-				for _, cm := range callMatches {
-					if len(cm) > 1 && cm[1] != funcName && cm[1] != "if" && cm[1] != "for" && cm[1] != "while" {
-						calls = append(calls, cm[1])
-						allCalls = append(allCalls, CallSpec{
-							CallerID:   funcID,
-							CalledName: cm[1],
-							LineNumber: funcStartLine,
-						})
-					}
-				}
+				// Single-line arrows share def and body on one line, so the
+				// definition line is scanned too; multi-line bodies skip it.
+				arrowBody := strings.Split(codeSlice, "\n")
+				arrowSpecs, calls := extractBraceCalls(arrowBody, funcStartLine, funcID, funcName, tsCallRegex, tsKeywordCalls, tsNestedDef, len(arrowBody) > 1)
+				allCalls = append(allCalls, arrowSpecs...)
 
 				sig := trimmed
 				arrowIdx := strings.Index(trimmed, "=>")

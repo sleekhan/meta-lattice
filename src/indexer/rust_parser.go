@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"path"
 	"regexp"
+	"sort"
 	"strings"
 
 	"meta-lattice/src/models"
@@ -15,6 +16,10 @@ var (
 	rustImplRegex   = regexp.MustCompile(`(?m)^\s*impl(?:<[^>]+>)?\s+(?:([a-zA-Z0-9_:]+)\s+for\s+)?([a-zA-Z0-9_]+)`)
 	rustFnRegex     = regexp.MustCompile(`(?m)^\s*(pub(?:\([^)]+\))?\s+)?(?:async\s+)?(?:const\s+)?(?:unsafe\s+)?fn\s+([a-zA-Z0-9_]+)(?:<[^>]+>)?\s*\(([^)]*)\)(?:\s*->\s*([^{;]+))?`)
 	rustCallRegex   = regexp.MustCompile(`\b([a-zA-Z0-9_]+)\s*\(`)
+	rustKeywordCalls = map[string]bool{
+		"if": true, "match": true, "for": true, "while": true,
+		"return": true, "let": true, "use": true,
+	}
 )
 
 func ParseRustFile(relPath string, code string, sha string, domain string) *ParsedFileResult {
@@ -62,13 +67,20 @@ func ParseRustFile(relPath string, code string, sha string, domain string) *Pars
 	var calls []CallSpec
 	var exports []string
 
+	type typePos struct {
+		id     string
+		offset int
+	}
+	var typePositions []typePos
+
 	// L2 Structs, Enums, Traits
-	for _, m := range rustTypeRegex.FindAllStringSubmatch(code, -1) {
-		kind := m[1]
-		name := m[2]
+	for _, idx := range rustTypeRegex.FindAllStringSubmatchIndex(code, -1) {
+		kind := code[idx[2]:idx[3]]
+		name := code[idx[4]:idx[5]]
 		exports = append(exports, name)
 
 		clsID := fmt.Sprintf("class:%s:%s", relPath, name)
+		typePositions = append(typePositions, typePos{id: clsID, offset: idx[0]})
 		classNodes = append(classNodes, models.L2ClassNode{
 			ID:        clsID,
 			Name:      name,
@@ -82,9 +94,10 @@ func ParseRustFile(relPath string, code string, sha string, domain string) *Pars
 	}
 
 	// L2 Impls
-	for _, m := range rustImplRegex.FindAllStringSubmatch(code, -1) {
-		targetType := m[2]
+	for _, idx := range rustImplRegex.FindAllStringSubmatchIndex(code, -1) {
+		targetType := code[idx[4]:idx[5]]
 		clsID := fmt.Sprintf("class:%s:%s", relPath, targetType)
+		typePositions = append(typePositions, typePos{id: clsID, offset: idx[0]})
 		exists := false
 		for _, c := range classNodes {
 			if c.ID == clsID {
@@ -106,7 +119,15 @@ func ParseRustFile(relPath string, code string, sha string, domain string) *Pars
 		}
 	}
 
-	// L3 Functions
+	// L3 Functions (parented to the nearest preceding type/impl by offset)
+	sort.Slice(typePositions, func(a, b int) bool { return typePositions[a].offset < typePositions[b].offset })
+	lineOffsets := make([]int, len(lines)+1)
+	for i, line := range lines {
+		if i == 0 {
+			lineOffsets[0] = 0
+		}
+		lineOffsets[i+1] = lineOffsets[i] + len(line) + 1
+	}
 	for lineNum, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "/*") || strings.HasPrefix(trimmed, "*") {
@@ -133,38 +154,30 @@ func ParseRustFile(relPath string, code string, sha string, domain string) *Pars
 
 			symID := fmt.Sprintf("symbol:%s:%s", relPath, fnName)
 
-			// Complexity & calls
-			complexity := 1
-			bodyLines := []string{line}
-			var fnCalls []string
-
-			for i := lineNum + 1; i < len(lines) && i < lineNum+150; i++ {
-				subLine := lines[i]
-				bodyLines = append(bodyLines, subLine)
-				subTrim := strings.TrimSpace(subLine)
-
-				if strings.HasPrefix(subTrim, "if ") || strings.HasPrefix(subTrim, "match ") ||
-					strings.HasPrefix(subTrim, "for ") || strings.HasPrefix(subTrim, "while ") ||
-					strings.Contains(subTrim, " && ") || strings.Contains(subTrim, " || ") ||
-					strings.HasSuffix(subTrim, "?") {
-					complexity++
-				}
-
-				for _, cm := range rustCallRegex.FindAllStringSubmatch(subLine, -1) {
-					cName := cm[1]
-					if cName != "if" && cName != "match" && cName != "for" && cName != "while" && cName != fnName {
-						fnCalls = append(fnCalls, cName)
-						calls = append(calls, CallSpec{
-							CallerID:   symID,
-							CalledName: cName,
-							LineNumber: i + 1,
-						})
-					}
-				}
-
-				if strings.Contains(subLine, "}") && !strings.Contains(subLine, "{") {
+			parentID := fileNode.ID
+			off := lineOffsets[lineNum]
+			for _, tp := range typePositions {
+				if tp.offset < off {
+					parentID = tp.id
+				} else {
 					break
 				}
+			}
+
+			// Complexity & calls with brace-depth termination so one-line
+			// bodies can't leak into following items.
+			bodyLines, foundCalls, complexity := scanBody(lines, lineNum, 150, rustCallRegex,
+				rustKeywordCalls, fnName,
+				[]string{"if ", "match ", "for ", "while "},
+				[]string{" && ", " || "}, rustFnRegex)
+			var fnCalls []string
+			for _, bc := range foundCalls {
+				fnCalls = append(fnCalls, bc.Name)
+				calls = append(calls, CallSpec{
+					CallerID:   symID,
+					CalledName: bc.Name,
+					LineNumber: bc.Line,
+				})
 			}
 
 			symbolNodes = append(symbolNodes, models.L3SymbolNode{
@@ -178,7 +191,7 @@ func ParseRustFile(relPath string, code string, sha string, domain string) *Pars
 				Code:                 strings.Join(bodyLines, "\n"),
 				CyclomaticComplexity: complexity,
 				Calls:                fnCalls,
-				ParentID:             fileNode.ID,
+				ParentID:             parentID,
 				IsPublic:             isPub,
 				Level:                string(models.LevelL3),
 				Labels:               []string{"L3Symbol", "Symbol", "Function"},
@@ -187,6 +200,7 @@ func ParseRustFile(relPath string, code string, sha string, domain string) *Pars
 	}
 
 	fileNode.Exports = exports
+	fillMethodSignatures(&classNodes, symbolNodes)
 
 	return &ParsedFileResult{
 		FileNode:    fileNode,

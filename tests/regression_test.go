@@ -196,21 +196,24 @@ func TestSearchSplitsCamelCase(t *testing.T) {
 	}
 }
 
-// A corrupt knowledge.lattice must be set aside and rebuilt by the next sync.
+// A corrupt graph database must be set aside and rebuilt by the next sync
+// (backend-agnostic: native LatticeDB file or JSON fallback, whichever is
+// active per DatabasePath()).
 func TestCorruptGraphDBIsRecovered(t *testing.T) {
 	dir := t.TempDir()
 	_ = os.WriteFile(filepath.Join(dir, "a.py"), []byte("def a():\n    return 1\n"), 0644)
 	cfg := config.NewLatticeConfig(dir)
 	indexer.NewCacheEngine(cfg, storage.NewGraphStorage(cfg.DBPath)).Sync(false)
 
-	_ = os.WriteFile(cfg.DBPath, []byte("{not json"), 0644)
+	dbPath := storage.NewGraphStorage(cfg.DBPath).DatabasePath()
+	_ = os.WriteFile(dbPath, []byte("{not json"), 0644)
 	db := storage.NewGraphStorage(cfg.DBPath)
 	indexer.NewCacheEngine(cfg, db).Sync(false)
 
 	if db.CountNodesAndEdges()["total_nodes"] == 0 {
 		t.Fatal("expected graph rebuilt after corruption")
 	}
-	if _, err := os.Stat(cfg.DBPath + ".corrupt"); err != nil {
+	if _, err := os.Stat(dbPath + ".corrupt"); err != nil {
 		t.Fatalf("expected corrupt file to be preserved: %v", err)
 	}
 }

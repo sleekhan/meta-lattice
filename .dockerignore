@@ -1,0 +1,14 @@
+# Binaries & release artifacts built inside the container land on the
+# bind-mounted host checkout; never send them back into the build context.
+meta-lattice
+meta-lattice.exe
+meta-lattice-*
+dist/
+liblattice.*
+
+# Lattice runtime cache & local graph storage.
+.lattice/
+
+# VCS / OS noise.
+.git/
+.DS_Store
