@@ -31,9 +31,11 @@ var SupportedExtensions = map[string]string{
 	".tsx":   "typescript",
 	".js":    "javascript",
 	".jsx":   "javascript",
-	".mjs":   "javascript",
-	".cjs":   "javascript",
-	".go":    "go",
+	".mjs":    "javascript",
+	".cjs":    "javascript",
+	".vue":    "vue",
+	".svelte": "svelte",
+	".go":     "go",
 	".java":  "java",
 	".kt":    "kotlin",
 	".kts":   "kotlin",
@@ -256,6 +258,10 @@ func (e *CacheEngine) parseFile(relPath string, absPath string, sha string) *Par
 		return ParsePythonFile(relPath, sourceCode, sha, domain)
 	case ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs":
 		return ParseTSJSFile(relPath, sourceCode, sha, domain)
+	case ".vue":
+		return ParseVueFile(relPath, sourceCode, sha, domain)
+	case ".svelte":
+		return ParseSvelteFile(relPath, sourceCode, sha, domain)
 	case ".java":
 		return ParseJavaFile(relPath, sourceCode, sha, domain)
 	case ".kt", ".kts":
@@ -700,7 +706,7 @@ func (e *CacheEngine) resolveAllCallEdges() {
 
 func (e *CacheEngine) resolveImportEdges(imports []ImportSpec, currentFiles map[string]string) {
 	exts := []string{
-		"", ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".go",
+		"", ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".svelte", ".go",
 		".java", ".kt", ".kts", ".cs", ".swift", ".php",
 		".rs", ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp",
 		"/__init__.py", "/index.ts", "/index.tsx", "/index.js", "/mod.rs",

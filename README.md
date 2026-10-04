@@ -37,7 +37,7 @@
 - **공식 LatticeDB 단일 파일 그래프 데이터베이스 탑재**: 공식 `github.com/jeffhajewski/latticedb/bindings/go`를 통해 `.lattice/knowledge.lattice` 단일 바이너리 파일로 L0~L3 지식 그래프 및 엣지 관계를 관리하며, 고속 조회를 위한 B-Tree 프로퍼티 인덱스를 자동 생성합니다.
 - **배포 아티팩트 내 네이티브 라이브러리 자동 번들링**: 릴리스 아카이브 내에 `liblattice` 동적 라이브러리와 RPATH(`@executable_path`, `$ORIGIN`)가 사전 구성되어 별도의 시스템 라이브러리 설치 없이 즉시 구동됩니다.
 - **대규모 프로젝트 최적화 멀티코어 병렬 파싱**: `runtime.GOMAXPROCS(0)` 기반 워커 풀(Worker Pool)을 적용하여 수천~수만 개의 대규모 프로젝트 파일도 CPU 코어 수에 맞추어 초고속 병렬 파싱합니다.
-- **엔터프라이즈 멀티 랭귀지 AST 파서 내장**: **Go**(`go/ast`, `go/parser`), **Python**, **TypeScript/JavaScript**, **Java**, **Kotlin**(`.kt`, `.kts`), **C#**(`.cs`), **Swift**(`.swift`), **PHP**(`.php`), **Rust**(`.rs`), **C/C++**(`.c`, `.cpp`, `.cc`, `.cxx`, `.h`, `.hpp`) 소스 코드를 네이티브 파싱하여 심볼, 시그니처, 클래스, 호출 그래프를 추출합니다.
+- **엔터프라이즈 멀티 랭귀지 AST 파서 내장**: **Go**(`go/ast`, `go/parser`), **Python**, **TypeScript/JavaScript**, **Java**, **Kotlin**(`.kt`, `.kts`), **C#**(`.cs`), **Swift**(`.swift`), **PHP**(`.php`), **Rust**(`.rs`), **C/C++**(`.c`, `.cpp`, `.cc`, `.cxx`, `.h`, `.hpp`) 소스 코드를 네이티브 파싱하여 심볼, 시그니처, 클래스, 호출 그래프를 추출합니다. 프론트엔드 지원: **Vue SFC**(`.vue`), **Svelte**(`.svelte`), **React JSX/TSX**(JSX 사용 엣지, PascalCase 컴포넌트 판별), **Angular**(`@Component` 데코레이터 인식).
 - **모노레포(Monorepo) 경로 매핑 지원**: TypeScript `tsconfig.json`의 경로 별칭(`@/*`, `~/*`) 및 모노레포 내 하위 디렉터리의 다중 `go.mod` 모듈 경로를 자동 감지하여 정확한 상호 파일 의존성 엣지를 구축합니다.
 - **MCP (Model Context Protocol) 서버 내장**: `stdio` 기반 JSON-RPC 2.0 로 MCP(protocolVersion `2024-11-05`, `tools` 기능)를 구현하여 Codex, Antigravity, Claude Code에서 사용할 수 있습니다.
 

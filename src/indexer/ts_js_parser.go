@@ -12,19 +12,57 @@ var (
 	tsImportRegex = regexp.MustCompile(`(?m)^\s*import\s+(?:(?:\*\s+as\s+([a-zA-Z0-9_]+)|{([^}]+)}|([a-zA-Z0-9_]+))\s+from\s+)?['"]([^'"]+)['"]`)
 	tsClassRegex  = regexp.MustCompile(`(?m)^\s*(?:export\s+)?(?:default\s+)?class\s+([a-zA-Z0-9_]+)(?:\s+extends\s+([a-zA-Z0-9_.]+))?(?:\s+implements\s+([^{]+))?\s*\{`)
 	tsIfaceRegex  = regexp.MustCompile(`(?m)^\s*(?:export\s+)?interface\s+([a-zA-Z0-9_]+)(?:\s+extends\s+([^{]+))?\s*\{`)
-	tsFuncRegex   = regexp.MustCompile(`(?m)^\s*(?:export\s+)?(?:async\s+)?function\s+([a-zA-Z0-9_]+)\s*\(`)
+	tsFuncRegex   = regexp.MustCompile(`(?m)^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+([a-zA-Z0-9_]+)\s*\(`)
 	tsArrowRegex  = regexp.MustCompile(`(?m)^\s*(?:export\s+)?(?:const|let|var)\s+([a-zA-Z0-9_]+)\s*=\s*(?:async\s+)?\([^)]*\)\s*(?::\s*[^=]+)?=>`)
 	tsCallRegex   = regexp.MustCompile(`([a-zA-Z0-9_]+)\s*\(`)
+	tsIdentRegex  = regexp.MustCompile(`^[A-Za-z_#][A-Za-z0-9_]*$`)
 	tsKeywordCalls = map[string]bool{
 		"if": true, "for": true, "while": true, "switch": true, "catch": true,
-		"return": true, "new": true, "typeof": true,
+		"return": true, "new": true, "typeof": true, "React": true,
 	}
+	jsxTagRegex = regexp.MustCompile(`<([A-Z][A-Za-z0-9_]*)`)
 )
 
 // tsNestedDef reports lines that open a nested named function, whose own
 // name must not be recorded as a call of the enclosing symbol.
 func tsNestedDef(trimmed string) bool {
 	return strings.Contains(trimmed, "function ")
+}
+
+// extractJSXCalls records PascalCase JSX tags (e.g. <UserCard />) as calls
+// of the enclosing symbol so React component usage builds CALLS edges.
+// have carries names already recorded by call-style extraction.
+func extractJSXCalls(body []string, baseLine int, callerID, selfName string, exclude map[string]bool, have []string) ([]CallSpec, []string) {
+	seen := make(map[string]bool, len(have))
+	for _, n := range have {
+		seen[n] = true
+	}
+	var specs []CallSpec
+	names := append([]string(nil), have...)
+	for i, l := range body {
+		trimmed := strings.TrimSpace(l)
+		if strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "/*") || strings.HasPrefix(trimmed, "*") {
+			continue
+		}
+		for _, m := range jsxTagRegex.FindAllStringSubmatch(l, -1) {
+			tag := m[1]
+			if tag == selfName || exclude[tag] || seen[tag] {
+				continue
+			}
+			seen[tag] = true
+			names = append(names, tag)
+			specs = append(specs, CallSpec{CallerID: callerID, CalledName: tag, LineNumber: baseLine + i})
+		}
+	}
+	return specs, names
+}
+
+// tsComponentKind marks top-level PascalCase functions as UI components.
+func tsComponentKind(name, fallback string) string {
+	if name != "" && name[0] >= 'A' && name[0] <= 'Z' {
+		return "component"
+	}
+	return fallback
 }
 
 func computeTSComplexity(lines []string) int {
@@ -118,6 +156,25 @@ func ParseTSJSFile(filePath string, sourceCode string, sha string, domain string
 					exports = append(exports, className)
 				}
 
+				// Angular-style decorator directly above (possibly multi-line,
+				// e.g. @Component({...})): mark component classes and keep the
+				// decorator opener as docs.
+				decorator := ""
+				for b := i - 1; b >= 0 && b >= i-8; b-- {
+					t := strings.TrimSpace(lines[b])
+					if t == "" || strings.HasSuffix(t, ",") || t == "})" || t == ")" || t == "{" {
+						continue
+					}
+					if strings.HasPrefix(t, "@") {
+						decorator = t
+					}
+					break
+				}
+				classKind := "class"
+				if strings.HasPrefix(decorator, "@Component") {
+					classKind = "component"
+				}
+
 				var bases []string
 				if len(m) > 2 && m[2] != "" {
 					bases = append(bases, strings.TrimSpace(m[2]))
@@ -134,6 +191,7 @@ func ParseTSJSFile(filePath string, sourceCode string, sha string, domain string
 				classStartLine := i + 1
 				// Find closing brace of class
 				braceCount := 0
+				memberDepth := 0
 				j := i
 				classEndLine := classStartLine
 				var classLines []string
@@ -143,11 +201,18 @@ func ParseTSJSFile(filePath string, sourceCode string, sha string, domain string
 				for j < len(lines) {
 					l := lines[j]
 					classLines = append(classLines, l)
+					depthBefore := braceCount
 					braceCount += strings.Count(l, "{") - strings.Count(l, "}")
 					classEndLine = j + 1
+					if j == i {
+						memberDepth = braceCount
+					}
 
-					// Inside class body: check methods
-					if j > i && braceCount >= 1 {
+					// Inside class body: check methods. Only lines at member
+					// depth are candidates, so call statements inside method
+					// bodies (e.g. `return persist();`) are never mistaken
+					// for sibling definitions.
+					if j > i && braceCount >= 1 && depthBefore == memberDepth {
 						t := strings.TrimSpace(l)
 						// Check method e.g. "login(username: string): boolean {" or "async login(...) {"
 						if strings.Contains(t, "(") && (strings.Contains(t, ")") || strings.Contains(t, "{")) && !strings.HasPrefix(t, "//") && !strings.HasPrefix(t, "*") {
@@ -157,7 +222,10 @@ func ParseTSJSFile(filePath string, sourceCode string, sha string, domain string
 							fields := strings.Fields(prefix)
 							if len(fields) > 0 {
 								methodName := fields[len(fields)-1]
-								if methodName != "if" && methodName != "for" && methodName != "while" && methodName != "switch" && methodName != "constructor" {
+								// A definition name is a bare identifier: dotted
+								// call lines like `this.service.get();` inside
+								// the class body are calls, not methods.
+								if tsIdentRegex.MatchString(methodName) && methodName != "if" && methodName != "for" && methodName != "while" && methodName != "switch" && methodName != "constructor" {
 									// Extract signature up to '{'
 									sig := t
 									braceIdx := strings.Index(t, "{")
@@ -187,6 +255,9 @@ func ParseTSJSFile(filePath string, sourceCode string, sha string, domain string
 
 									methodSpecs, calls := extractBraceCalls(methodLines, methodStartLine, methodID, methodName, tsCallRegex, tsKeywordCalls, tsNestedDef, len(methodLines) > 1)
 									allCalls = append(allCalls, methodSpecs...)
+									jsxSpecs, jsxNames := extractJSXCalls(methodLines, methodStartLine, methodID, methodName, tsKeywordCalls, calls)
+									allCalls = append(allCalls, jsxSpecs...)
+									calls = jsxNames
 
 									symbolNodes = append(symbolNodes, models.L3SymbolNode{
 										ID:                   methodID,
@@ -203,7 +274,7 @@ func ParseTSJSFile(filePath string, sourceCode string, sha string, domain string
 										Calls:                uniqueStrings(calls),
 										Level:                string(models.LevelL3),
 										Labels:               []string{"L3Symbol", "Symbol", "Function"},
-									})
+								})
 								}
 							}
 						}
@@ -219,10 +290,11 @@ func ParseTSJSFile(filePath string, sourceCode string, sha string, domain string
 					ID:               classID,
 					Name:             className,
 					FilePath:         filePath,
-					Kind:             "class",
+					Kind:             classKind,
 					Bases:            bases,
 					LineStart:        classStartLine,
 					LineEnd:          classEndLine,
+					Docstring:        decorator,
 					IsPublic:         isExported,
 					MethodSignatures: methodSigs,
 					FieldSignatures:  fieldSigs,
@@ -343,13 +415,16 @@ func ParseTSJSFile(filePath string, sourceCode string, sha string, domain string
 
 				funcSpecs, calls := extractBraceCalls(funcLines, funcStartLine, funcID, funcName, tsCallRegex, tsKeywordCalls, tsNestedDef, len(funcLines) > 1)
 				allCalls = append(allCalls, funcSpecs...)
+				jsxSpecs, jsxNames := extractJSXCalls(funcLines, funcStartLine, funcID, funcName, tsKeywordCalls, calls)
+				allCalls = append(allCalls, jsxSpecs...)
+				calls = jsxNames
 
 				symbolNodes = append(symbolNodes, models.L3SymbolNode{
 					ID:                   funcID,
 					Name:                 funcName,
 					ParentID:             fileID,
 					FilePath:             filePath,
-					Kind:                 "function",
+					Kind:                 tsComponentKind(funcName, "function"),
 					LineStart:            funcStartLine,
 					LineEnd:              funcEndLine,
 					Signature:            sig,
@@ -421,6 +496,9 @@ func ParseTSJSFile(filePath string, sourceCode string, sha string, domain string
 				arrowBody := strings.Split(codeSlice, "\n")
 				arrowSpecs, calls := extractBraceCalls(arrowBody, funcStartLine, funcID, funcName, tsCallRegex, tsKeywordCalls, tsNestedDef, len(arrowBody) > 1)
 				allCalls = append(allCalls, arrowSpecs...)
+				jsxSpecs, jsxNames := extractJSXCalls(arrowBody, funcStartLine, funcID, funcName, tsKeywordCalls, calls)
+				allCalls = append(allCalls, jsxSpecs...)
+				calls = jsxNames
 
 				sig := trimmed
 				arrowIdx := strings.Index(trimmed, "=>")
@@ -433,7 +511,7 @@ func ParseTSJSFile(filePath string, sourceCode string, sha string, domain string
 					Name:                 funcName,
 					ParentID:             fileID,
 					FilePath:             filePath,
-					Kind:                 "function",
+					Kind:                 tsComponentKind(funcName, "function"),
 					LineStart:            funcStartLine,
 					LineEnd:              funcEndLine,
 					Signature:            sig,
