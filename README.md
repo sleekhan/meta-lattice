@@ -18,6 +18,10 @@
   <a href="#-단위-테스트-검증-test-results"><img src="https://img.shields.io/badge/Tests-25%20Passing-brightgreen.svg?style=flat-square" alt="Tests" /></a>
 </p>
 
+<p align="center">
+  <strong>🇰🇷 한국어</strong> · <a href="README.en.md">🇺🇸 English</a>
+</p>
+
 ---
 
 ## 📖 개요 (Overview)
