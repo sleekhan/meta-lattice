@@ -152,7 +152,7 @@ make build DOCKER=0
 make test DOCKER=0
 ```
 
-### 4. GitHub Actions 릴리스 & 자동 배포 (Release & Publish)
+### 4. GitHub Actions 릴리스 및 자동 배포 (Release and Publish)
 테스트 없이 Windows, Linux, macOS 바이너리를 초고속으로 빌드하고 필수 파일만 묶어 GitHub Releases에 자동 발행합니다.
 
 - **트리거 방법**:
@@ -162,7 +162,7 @@ make test DOCKER=0
      git push origin v1.0.0
      ```
   2. **GitHub 웹 UI 수동 실행 (`workflow_dispatch`)**:
-     GitHub 저장소의 `Actions` 탭 -> `Release & Publish` -> `Run workflow` 클릭 (버전 태그 지정 가능).
+     GitHub 저장소의 `Actions` 탭 -> `Release and Publish` -> `Run workflow` 클릭 (버전 태그 지정 가능).
 
 - **배포 아티팩트 (dist/) - 각 OS당 2종 패키지 제공**:
   - **LatticeDB 네이티브 버전 (CGO + 네이티브 공유 라이브러리 번들링)**:

@@ -152,7 +152,7 @@ make build DOCKER=0
 make test DOCKER=0
 ```
 
-### 4. GitHub Actions Release & Publish
+### 4. GitHub Actions Release and Publish
 Builds Windows, Linux, and macOS binaries at high speed without tests, bundles only the essential files, and publishes them to GitHub Releases automatically.
 
 - **Triggers**:
@@ -162,7 +162,7 @@ Builds Windows, Linux, and macOS binaries at high speed without tests, bundles o
      git push origin v1.0.0
      ```
   2. **Manual run from the GitHub web UI (`workflow_dispatch`)**:
-     Go to the repo's `Actions` tab -> `Release & Publish` -> `Run workflow` (version tag optional).
+     Go to the repo's `Actions` tab -> `Release and Publish` -> `Run workflow` (version tag optional).
 
 - **Artifacts (dist/) - 2 Packages per OS**:
   - **LatticeDB Native Flavors (CGO + Bundled Shared Library)**:
