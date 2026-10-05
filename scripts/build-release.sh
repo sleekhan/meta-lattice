@@ -63,6 +63,12 @@ for target in "${TARGETS[@]}"; do
     if [ "${USE_NATIVE}" = "1" ] && [ "${OS}" = "linux" ] && [ "${ARCH}" = "${CONTAINER_ARCH}" ]; then
       BUILDER_IMAGE="${BUILDER_IMAGE}" VERSION="${VERSION}" \
         "${DOCKER_BUILD}" native-linux "${ARCH}" "${STAGING_DIR}/${BIN_NAME}"
+    elif [ "${USE_NATIVE}" = "1" ] && [ "${OS}" = "windows" ] && [ "${ARCH}" = "amd64" ]; then
+      BUILDER_IMAGE="${BUILDER_IMAGE}" VERSION="${VERSION}" \
+        "${DOCKER_BUILD}" windows-native "${STAGING_DIR}/${BIN_NAME}"
+      # Also bundle a standalone portable executable as fallback
+      BUILDER_IMAGE="${BUILDER_IMAGE}" VERSION="${VERSION}" \
+        "${DOCKER_BUILD}" windows-nolattice "${STAGING_DIR}/meta-lattice-portable.exe"
     else
       # Portable build: CGO off, embedded pure-Go engine (runs everywhere).
       BUILDER_IMAGE="${BUILDER_IMAGE}" VERSION="${VERSION}" \
@@ -77,12 +83,15 @@ for target in "${TARGETS[@]}"; do
 
   # 2. Bundle essential files & native libraries
   cp "${ROOT_DIR}/README.md" "${STAGING_DIR}/"
+  [ -f "${ROOT_DIR}/README.ko.md" ] && cp "${ROOT_DIR}/README.ko.md" "${STAGING_DIR}/"
+  [ -f "${ROOT_DIR}/README.en.md" ] && cp "${ROOT_DIR}/README.en.md" "${STAGING_DIR}/"
   cp "${ROOT_DIR}/LICENSE" "${STAGING_DIR}/"
   cp "${ROOT_DIR}/${INSTALLER}" "${STAGING_DIR}/"
   [ -f "${ROOT_DIR}/AGENTS.md" ] && cp "${ROOT_DIR}/AGENTS.md" "${STAGING_DIR}/"
   [ -f "${ROOT_DIR}/GEMINI.md" ] && cp "${ROOT_DIR}/GEMINI.md" "${STAGING_DIR}/"
   [ -f "${ROOT_DIR}/CLAUDE.md" ] && cp "${ROOT_DIR}/CLAUDE.md" "${STAGING_DIR}/"
   [ -f "${ROOT_DIR}/.mcp.json" ] && cp "${ROOT_DIR}/.mcp.json" "${STAGING_DIR}/"
+  [ -d "${ROOT_DIR}/docs" ] && cp -r "${ROOT_DIR}/docs" "${STAGING_DIR}/"
 
   # Bundle native LatticeDB shared library if available.
   # (Portable CGO-off binaries ignore it and use the embedded pure-Go engine;

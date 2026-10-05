@@ -21,7 +21,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
         zip \
         ca-certificates \
+        curl \
+        xz-utils \
+        mingw-w64 \
     && rm -rf /var/lib/apt/lists/* \
+    && dpkgArch="$(dpkg --print-architecture)" \
+    && case "${dpkgArch}" in \
+        amd64) ZIG_ARCH="x86_64" ;; \
+        arm64) ZIG_ARCH="aarch64" ;; \
+        *) echo "Unsupported architecture for zig: ${dpkgArch}" >&2; exit 1 ;; \
+       esac \
+    && curl -fsSL "https://ziglang.org/download/0.16.0/zig-${ZIG_ARCH}-linux-0.16.0.tar.xz" -o /tmp/zig.tar.xz \
+    && tar -xJf /tmp/zig.tar.xz -C /usr/local \
+    && mv /usr/local/zig-${ZIG_ARCH}-linux-0.16.0 /usr/local/zig \
+    && ln -s /usr/local/zig/zig /usr/local/bin/zig \
+    && rm -f /tmp/zig.tar.xz \
+    && zig version \
     && go version
 
 WORKDIR /work

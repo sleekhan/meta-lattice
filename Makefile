@@ -19,7 +19,7 @@ BUILDER_IMAGE?=meta-lattice-builder:latest
 
 all: build windows
 
-## build: Compile binary for the host platform (Docker by default)
+## build: Compile binary for the host platform (default fallback/portable or host-native depending on DOCKER)
 build:
 ifeq ($(DOCKER),1)
 	@BUILDER_IMAGE=$(BUILDER_IMAGE) VERSION=$(VERSION) ./scripts/docker-build.sh build $(BINARY_NAME)
@@ -27,17 +27,51 @@ else
 	@$(MAKE) build-host
 endif
 
-## windows: Cross-compile for Windows x86 64-bit (windows/amd64, portable engine)
-windows:
+## build-native: Compile host binary WITH native LatticeDB (CGO enabled)
+build-native:
 ifeq ($(DOCKER),1)
-	@BUILDER_IMAGE=$(BUILDER_IMAGE) VERSION=$(VERSION) ./scripts/docker-build.sh windows $(WIN_BINARY_NAME)
+	@BUILDER_IMAGE=$(BUILDER_IMAGE) VERSION=$(VERSION) ./scripts/docker-build.sh build-native $(BINARY_NAME)
+else
+	@$(MAKE) build-host
+endif
+
+## build-nolattice: Compile host binary WITHOUT LatticeDB (pure-Go engine, standalone)
+build-nolattice:
+ifeq ($(DOCKER),1)
+	@BUILDER_IMAGE=$(BUILDER_IMAGE) VERSION=$(VERSION) ./scripts/docker-build.sh build-nolattice $(BINARY_NAME)-nolattice
+else
+	@echo "Building pure-Go host binary ($(BINARY_NAME)-nolattice)..."
+	CGO_ENABLED=0 go build -tags nolattice -ldflags="-s -w" -o $(BINARY_NAME)-nolattice $(SRC_DIR)
+endif
+
+## windows: Cross-compile for Windows x86 64-bit (defaults to portable nolattice engine)
+windows: windows-nolattice
+
+## windows-native: Compile Windows x86 64-bit binary WITH native LatticeDB (CGO + DLL)
+windows-native:
+	@echo "Building Windows x86 64-bit binary with native LatticeDB (CGO + DLL)..."
+	@BUILDER_IMAGE=$(BUILDER_IMAGE) VERSION=$(VERSION) ./scripts/docker-build.sh windows-native $(WIN_BINARY_NAME)
+
+## windows-nolattice: Cross-compile for Windows x86 64-bit WITHOUT LatticeDB (portable standalone)
+windows-nolattice:
+ifeq ($(DOCKER),1)
+	@BUILDER_IMAGE=$(BUILDER_IMAGE) VERSION=$(VERSION) ./scripts/docker-build.sh windows-nolattice $(WIN_BINARY_NAME)
 else
 	@$(MAKE) windows-host
 endif
 
-## build-all: Compile both host and Windows x86 64-bit binaries
+## latticedb-dll: Compile LatticeDB Windows DLL using Zig Docker
+latticedb-dll:
+	@echo "Compiling LatticeDB Windows DLL via Zig Docker..."
+	@./scripts/build-latticedb-dll.sh x86_64-windows-gnu
+
+## build-all: Compile both host and Windows x86 64-bit binaries (standard portable)
 build-all: build windows
-	@echo "All binaries successfully built."
+	@echo "Standard binaries successfully built."
+
+## build-all-flavors: Compile all variants (native with LatticeDB & pure-Go nolattice for all platforms)
+build-all-flavors:
+	@BUILDER_IMAGE=$(BUILDER_IMAGE) VERSION=$(VERSION) ./scripts/docker-build.sh all-flavors
 
 ## release / package: Build multi-platform release packages (Windows, Linux, macOS)
 ## Uses Docker by default (DOCKER=1); set DOCKER=0 for host-toolchain builds.

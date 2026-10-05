@@ -1,0 +1,10 @@
+prefix=${pcfiledir}/../..
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: lattice
+Description: Embedded knowledge graph database for AI and RAG applications
+Version: 0.15.0
+Libs: -L${libdir} -llattice
+Cflags: -I${includedir}
