@@ -45,7 +45,16 @@ jobs:
             target_arch: arm64
             pkg_format: tar.gz
             installer: install.sh
+            apt_packages: gcc-aarch64-linux-gnu
             cross_cc: aarch64-linux-gnu-gcc
+          - name: Windows x86_64
+            os: ubuntu-latest
+            target_os: windows
+            target_arch: amd64
+            pkg_format: zip
+            installer: install.ps1
+            apt_packages: gcc-mingw-w64-x86-64 zip
+            cross_cc: x86_64-w64-mingw32-gcc
           - name: macOS Apple Silicon
             os: macos-latest
             target_os: darwin
@@ -58,12 +67,6 @@ jobs:
             target_arch: amd64
             pkg_format: tar.gz
             installer: install.sh
-          - name: Windows x86_64
-            os: windows-latest
-            target_os: windows
-            target_arch: amd64
-            pkg_format: zip
-            installer: install.ps1
 
     steps:
       - name: Checkout Code
@@ -75,11 +78,19 @@ jobs:
           go-version: 'stable'
           cache: false
 
-      - name: Install Linux ARM64 Cross Compiler
-        if: matrix.platform.cross_cc == 'aarch64-linux-gnu-gcc'
+      - name: Install Linux Build Dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          sudo apt-get install -y pkg-config zip
+          if [ -n "${{ matrix.platform.apt_packages }}" ]; then
+            sudo apt-get install -y ${{ matrix.platform.apt_packages }}
+          fi
+
+      - name: Install macOS Build Dependencies
+        if: runner.os == 'macOS'
+        run: |
+          brew install pkg-config || true
 
       - name: Determine Version
         id: version
@@ -107,11 +118,16 @@ jobs:
           INSTALLER: ${{ matrix.platform.installer }}
           CROSS_CC: ${{ matrix.platform.cross_cc }}
         run: |
+          set -euo pipefail
           COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo 'release')"
           BUILD_DATE="$(date -u +'%Y-%m-%d')"
           LDFLAGS="-s -w -X main.Version=${VERSION} -X main.GitCommit=${COMMIT} -X main.BuildDate=${BUILD_DATE}"
           BIN_NAME="meta-lattice"
           [ "${TARGET_OS}" = "windows" ] && BIN_NAME="meta-lattice.exe"
+
+          ROOT_ABS="$(pwd)"
+          LAT_LIB_DIR="${ROOT_ABS}/deps/latticedb/lib/${TARGET_OS}-${TARGET_ARCH}"
+          LAT_INC_DIR="${ROOT_ABS}/deps/latticedb/include"
 
           mkdir -p dist/packages
 
@@ -137,14 +153,9 @@ jobs:
 
           compress_package() {
             local name="$1"
+            echo "    -> Packaging ${name}.${PKG_FORMAT}..."
             if [ "${PKG_FORMAT}" = "zip" ]; then
-              if command -v zip >/dev/null 2>&1; then
-                (cd dist && zip -q -r "packages/${name}.zip" "${name}")
-              elif command -v 7z >/dev/null 2>&1; then
-                (cd dist && 7z a -tzip "packages/${name}.zip" "${name}")
-              else
-                powershell -Command "Compress-Archive -Path 'dist/${name}' -DestinationPath 'dist/packages/${name}.zip'"
-              fi
+              (cd dist && zip -q -r "packages/${name}.zip" "${name}")
             else
               (cd dist && tar -czf "packages/${name}.tar.gz" "${name}")
             fi
@@ -170,29 +181,42 @@ jobs:
           mkdir -p "dist/${LATTICE_NAME}"
           echo "==> Building LatticeDB Native binary for ${TARGET_OS}/${TARGET_ARCH}..."
 
-          ROOT_ABS="$(pwd)"
-          if [ "${TARGET_OS}" = "windows" ]; then
-            CGO_ENABLED=1 GOOS=windows GOARCH=amd64 \
-            CGO_CFLAGS="-I${ROOT_ABS}/deps/latticedb/include" \
-            CGO_LDFLAGS="-L${ROOT_ABS}/deps/latticedb/lib/windows-amd64 -llattice" \
-              go build -ldflags="${LDFLAGS}" -o "dist/${LATTICE_NAME}/${BIN_NAME}" ./src
-          elif [ "${TARGET_OS}" = "darwin" ]; then
-            CGO_ENABLED=1 GOOS=darwin GOARCH="${TARGET_ARCH}" \
-            CGO_CFLAGS="-I${ROOT_ABS}/deps/latticedb/include" \
-            CGO_LDFLAGS="-L${ROOT_ABS}/deps/latticedb/lib/darwin-${TARGET_ARCH} -llattice -Wl,-rpath,@executable_path" \
-              go build -ldflags="${LDFLAGS}" -o "dist/${LATTICE_NAME}/${BIN_NAME}" ./src
-          else # linux
-            CC_ENV=""
-            [ -n "${CROSS_CC}" ] && CC_ENV="${CROSS_CC}"
-            CC="${CC_ENV:-gcc}" CGO_ENABLED=1 GOOS=linux GOARCH="${TARGET_ARCH}" \
-            CGO_CFLAGS="-I${ROOT_ABS}/deps/latticedb/include" \
-            CGO_LDFLAGS="-L${ROOT_ABS}/deps/latticedb/lib/linux-${TARGET_ARCH} -llattice -Wl,-rpath,\$ORIGIN" \
-              go build -ldflags="${LDFLAGS}" -o "dist/${LATTICE_NAME}/${BIN_NAME}" ./src
+          # Dynamically stage an absolute lattice.pc file for pkg-config
+          PC_DIR="/tmp/lat-pc-${TARGET_OS}-${TARGET_ARCH}"
+          mkdir -p "${PC_DIR}"
+          cat << EOF > "${PC_DIR}/lattice.pc"
+prefix=${ROOT_ABS}
+libdir=${LAT_LIB_DIR}
+includedir=${LAT_INC_DIR}
+Name: lattice
+Description: Embedded knowledge graph
+Version: 0.15.0
+Libs: -L\${libdir} -llattice
+Cflags: -I\${includedir}
+EOF
+
+          export PKG_CONFIG_PATH="${PC_DIR}:${PKG_CONFIG_PATH:-}"
+
+          # Setup platform-specific CGO flags
+          if [ "${TARGET_OS}" = "darwin" ]; then
+            export CGO_LDFLAGS="-Wl,-rpath,@executable_path"
+          elif [ "${TARGET_OS}" = "linux" ]; then
+            export CGO_LDFLAGS="-Wl,-rpath,\$ORIGIN"
+          else
+            export CGO_LDFLAGS=""
           fi
 
+          if [ -n "${CROSS_CC}" ]; then
+            export CC="${CROSS_CC}"
+          fi
+
+          CGO_ENABLED=1 GOOS="${TARGET_OS}" GOARCH="${TARGET_ARCH}" \
+            go build -ldflags="${LDFLAGS}" -o "dist/${LATTICE_NAME}/${BIN_NAME}" ./src
+
           # Bundle native shared library (.dll, .so, .dylib)
-          if [ -d "deps/latticedb/lib/${TARGET_OS}-${TARGET_ARCH}" ]; then
-            cp -f "deps/latticedb/lib/${TARGET_OS}-${TARGET_ARCH}/"* "dist/${LATTICE_NAME}/" 2>/dev/null || true
+          if [ -d "${LAT_LIB_DIR}" ]; then
+            echo "    -> Bundling native shared library from ${LAT_LIB_DIR}..."
+            cp -f "${LAT_LIB_DIR}/"* "dist/${LATTICE_NAME}/" 2>/dev/null || true
           fi
 
           bundle_files "dist/${LATTICE_NAME}"
