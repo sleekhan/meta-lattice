@@ -147,20 +147,41 @@ for target in "${TARGETS[@]}"; do
       arm64|aarch64) HOST_ARCH="arm64" ;;
     esac
 
+    # Stage target-specific lattice.pc for pkg-config
+    PC_DIR="/tmp/lat-pc-${OS}-${ARCH}"
+    mkdir -p "${PC_DIR}"
+    cat << EOF > "${PC_DIR}/lattice.pc"
+prefix=${ROOT_DIR}
+libdir=${ROOT_DIR}/deps/latticedb/lib/${OS}-${ARCH}
+includedir=${ROOT_DIR}/deps/latticedb/include
+Name: lattice
+Description: Embedded knowledge graph
+Version: 0.15.0
+Libs: -L\${libdir} -llattice
+Cflags: -I\${includedir}
+EOF
+
+    TARGET_PKG_CONFIG_PATH="${PC_DIR}:${PKG_CONFIG_PATH:-}"
+
     if [ "${HOST_OS}" = "${OS}" ] && [ "${HOST_ARCH}" = "${ARCH}" ]; then
       echo "      * Compiling native CGO on host for ${OS}/${ARCH}..."
-      PKG_CONFIG_PATH="${ROOT_DIR}/deps/latticedb/lib/pkgconfig:${PKG_CONFIG_PATH:-}" \
+      PKG_CONFIG_PATH="${TARGET_PKG_CONFIG_PATH}" \
       CGO_LDFLAGS="-Wl,-rpath,@executable_path -Wl,-rpath,${ROOT_DIR} -Wl,-rpath,\$ORIGIN" \
       CGO_ENABLED=1 GOOS="${OS}" GOARCH="${ARCH}" \
         go build -ldflags="${LDFLAGS}" -o "${LATTICE_STAGING}/${BIN_NAME}" "${SRC_DIR}"
     elif [ "${OS}" = "windows" ] && [ "${ARCH}" = "amd64" ] && command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
       echo "      * Cross-compiling Windows native CGO with MinGW..."
+      PKG_CONFIG_PATH="${TARGET_PKG_CONFIG_PATH}" \
       CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC=x86_64-w64-mingw32-gcc \
-      CGO_CFLAGS="-I${ROOT_DIR}/deps/latticedb/include" \
-      CGO_LDFLAGS="-L${ROOT_DIR}/deps/latticedb/lib/windows-amd64 -llattice" \
+        go build -ldflags="${LDFLAGS}" -o "${LATTICE_STAGING}/${BIN_NAME}" "${SRC_DIR}"
+    elif [ "${OS}" = "linux" ] && [ "${ARCH}" = "arm64" ] && command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
+      echo "      * Cross-compiling Linux ARM64 native CGO with aarch64-linux-gnu-gcc..."
+      PKG_CONFIG_PATH="${TARGET_PKG_CONFIG_PATH}" \
+      CGO_LDFLAGS="-Wl,-rpath,\$ORIGIN" \
+      CGO_ENABLED=1 GOOS=linux GOARCH=arm64 CC=aarch64-linux-gnu-gcc \
         go build -ldflags="${LDFLAGS}" -o "${LATTICE_STAGING}/${BIN_NAME}" "${SRC_DIR}"
     else
-      echo "      * Fallback: compiling binary with bundled native libraries for ${OS}/${ARCH}..."
+      echo "      * Bundling native shared library with portable engine fallback for ${OS}/${ARCH}..."
       CGO_ENABLED=0 GOOS="${OS}" GOARCH="${ARCH}" \
         go build -tags nolattice -ldflags="${LDFLAGS}" -o "${LATTICE_STAGING}/${BIN_NAME}" "${SRC_DIR}"
     fi

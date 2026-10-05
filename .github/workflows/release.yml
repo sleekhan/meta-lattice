@@ -26,51 +26,15 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    name: Build (${{ matrix.platform.name }})
-    runs-on: ${{ matrix.platform.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        platform:
-          - name: Linux x86_64
-            os: ubuntu-latest
-            target_os: linux
-            target_arch: amd64
-            pkg_format: tar.gz
-            installer: install.sh
-          - name: Linux ARM64
-            os: ubuntu-latest
-            target_os: linux
-            target_arch: arm64
-            pkg_format: tar.gz
-            installer: install.sh
-            apt_packages: gcc-aarch64-linux-gnu
-            cross_cc: aarch64-linux-gnu-gcc
-          - name: Windows x86_64
-            os: ubuntu-latest
-            target_os: windows
-            target_arch: amd64
-            pkg_format: zip
-            installer: install.ps1
-            apt_packages: gcc-mingw-w64-x86-64 zip
-            cross_cc: x86_64-w64-mingw32-gcc
-          - name: macOS Apple Silicon
-            os: macos-latest
-            target_os: darwin
-            target_arch: arm64
-            pkg_format: tar.gz
-            installer: install.sh
-          - name: macOS Intel
-            os: macos-13
-            target_os: darwin
-            target_arch: amd64
-            pkg_format: tar.gz
-            installer: install.sh
+  build-and-publish:
+    name: Build & Publish Release
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -78,19 +42,10 @@ jobs:
           go-version: 'stable'
           cache: false
 
-      - name: Install Linux Build Dependencies
-        if: runner.os == 'Linux'
+      - name: Install Build Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config zip
-          if [ -n "${{ matrix.platform.apt_packages }}" ]; then
-            sudo apt-get install -y ${{ matrix.platform.apt_packages }}
-          fi
-
-      - name: Install macOS Build Dependencies
-        if: runner.os == 'macOS'
-        run: |
-          brew install pkg-config || true
+          sudo apt-get install -y pkg-config zip gcc-mingw-w64-x86-64 gcc-aarch64-linux-gnu
 
       - name: Determine Version
         id: version
@@ -107,174 +62,19 @@ jobs:
             TAG="v${TAG}"
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Building version: $TAG"
 
-      - name: Build Dual Packages (LatticeDB & Pure-Go)
-        shell: bash
-        env:
-          VERSION: ${{ steps.version.outputs.tag }}
-          TARGET_OS: ${{ matrix.platform.target_os }}
-          TARGET_ARCH: ${{ matrix.platform.target_arch }}
-          PKG_FORMAT: ${{ matrix.platform.pkg_format }}
-          INSTALLER: ${{ matrix.platform.installer }}
-          CROSS_CC: ${{ matrix.platform.cross_cc }}
-        run: |
-          set -euo pipefail
-          COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo 'release')"
-          BUILD_DATE="$(date -u +'%Y-%m-%d')"
-          LDFLAGS="-s -w -X main.Version=${VERSION} -X main.GitCommit=${COMMIT} -X main.BuildDate=${BUILD_DATE}"
-          BIN_NAME="meta-lattice"
-          [ "${TARGET_OS}" = "windows" ] && BIN_NAME="meta-lattice.exe"
-
-          ROOT_ABS="$(pwd)"
-          LAT_LIB_DIR="${ROOT_ABS}/deps/latticedb/lib/${TARGET_OS}-${TARGET_ARCH}"
-          LAT_INC_DIR="${ROOT_ABS}/deps/latticedb/include"
-
-          mkdir -p dist/packages
-
-          bundle_files() {
-            local dir="$1"
-            cp README.md "${dir}/"
-            [ -f README.ko.md ] && cp README.ko.md "${dir}/"
-            [ -f README.en.md ] && cp README.en.md "${dir}/"
-            cp LICENSE "${dir}/"
-            cp "${INSTALLER}" "${dir}/"
-            [ -f AGENTS.md ] && cp AGENTS.md "${dir}/"
-            [ -f GEMINI.md ] && cp GEMINI.md "${dir}/"
-            [ -f CLAUDE.md ] && cp CLAUDE.md "${dir}/"
-            [ -f .mcp.json ] && cp .mcp.json "${dir}/"
-            [ -d docs ] && cp -r docs "${dir}/"
-            [ -d commands ] && cp -r commands "${dir}/"
-            [ -d skills ] && cp -r skills "${dir}/"
-            [ -d hooks ] && cp -r hooks "${dir}/"
-            [ -d .agents ] && cp -r .agents "${dir}/"
-            [ -d .claude-plugin ] && cp -r .claude-plugin "${dir}/"
-            [ -d .codex ] && cp -r .codex "${dir}/"
-          }
-
-          compress_package() {
-            local name="$1"
-            echo "    -> Packaging ${name}.${PKG_FORMAT}..."
-            if [ "${PKG_FORMAT}" = "zip" ]; then
-              (cd dist && zip -q -r "packages/${name}.zip" "${name}")
-            else
-              (cd dist && tar -czf "packages/${name}.tar.gz" "${name}")
-            fi
-            rm -rf "dist/${name}"
-          }
-
-          # -------------------------------------------------------------
-          # 1) Pure-Go Package (Zero external dependencies)
-          # -------------------------------------------------------------
-          PUREGO_NAME="meta-lattice-${VERSION}-${TARGET_OS}-${TARGET_ARCH}-purego"
-          mkdir -p "dist/${PUREGO_NAME}"
-          echo "==> Building Pure-Go binary for ${TARGET_OS}/${TARGET_ARCH}..."
-          CGO_ENABLED=0 GOOS="${TARGET_OS}" GOARCH="${TARGET_ARCH}" \
-            go build -tags nolattice -ldflags="${LDFLAGS}" -o "dist/${PUREGO_NAME}/${BIN_NAME}" ./src
-
-          bundle_files "dist/${PUREGO_NAME}"
-          compress_package "${PUREGO_NAME}"
-
-          # -------------------------------------------------------------
-          # 2) LatticeDB Package (Native CGO + LatticeDB Shared Library)
-          # -------------------------------------------------------------
-          LATTICE_NAME="meta-lattice-${VERSION}-${TARGET_OS}-${TARGET_ARCH}-latticedb"
-          mkdir -p "dist/${LATTICE_NAME}"
-          echo "==> Building LatticeDB Native binary for ${TARGET_OS}/${TARGET_ARCH}..."
-
-          # Dynamically stage an absolute lattice.pc file for pkg-config
-          PC_DIR="/tmp/lat-pc-${TARGET_OS}-${TARGET_ARCH}"
-          mkdir -p "${PC_DIR}"
-          cat << EOF > "${PC_DIR}/lattice.pc"
-prefix=${ROOT_ABS}
-libdir=${LAT_LIB_DIR}
-includedir=${LAT_INC_DIR}
-Name: lattice
-Description: Embedded knowledge graph
-Version: 0.15.0
-Libs: -L\${libdir} -llattice
-Cflags: -I\${includedir}
-EOF
-
-          export PKG_CONFIG_PATH="${PC_DIR}:${PKG_CONFIG_PATH:-}"
-
-          # Setup platform-specific CGO flags
-          if [ "${TARGET_OS}" = "darwin" ]; then
-            export CGO_LDFLAGS="-Wl,-rpath,@executable_path"
-          elif [ "${TARGET_OS}" = "linux" ]; then
-            export CGO_LDFLAGS="-Wl,-rpath,\$ORIGIN"
-          else
-            export CGO_LDFLAGS=""
-          fi
-
-          if [ -n "${CROSS_CC}" ]; then
-            export CC="${CROSS_CC}"
-          fi
-
-          CGO_ENABLED=1 GOOS="${TARGET_OS}" GOARCH="${TARGET_ARCH}" \
-            go build -ldflags="${LDFLAGS}" -o "dist/${LATTICE_NAME}/${BIN_NAME}" ./src
-
-          # Bundle native shared library (.dll, .so, .dylib)
-          if [ -d "${LAT_LIB_DIR}" ]; then
-            echo "    -> Bundling native shared library from ${LAT_LIB_DIR}..."
-            cp -f "${LAT_LIB_DIR}/"* "dist/${LATTICE_NAME}/" 2>/dev/null || true
-          fi
-
-          bundle_files "dist/${LATTICE_NAME}"
-          compress_package "${LATTICE_NAME}"
-
-          echo "==> Built packages for ${TARGET_OS}/${TARGET_ARCH}:"
-          ls -lh dist/packages/
-
-      - name: Upload Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: packages-${{ matrix.platform.target_os }}-${{ matrix.platform.target_arch }}
-          path: dist/packages/*
-          if-no-files-found: error
-
-  publish:
-    name: Publish Release
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Determine Version
-        id: version
+      - name: Build & Package (10 Packages: LatticeDB & Pure-Go per OS)
         shell: bash
         run: |
-          if [ -n "${{ inputs.tag_name }}" ]; then
-            TAG="${{ inputs.tag_name }}"
-          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            TAG="${GITHUB_REF#refs/tags/}"
-          else
-            TAG="v1.0.0"
-          fi
-          if [[ ! "$TAG" =~ ^v ]]; then
-            TAG="v${TAG}"
-          fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          chmod +x scripts/build-release.sh
+          ./scripts/build-release.sh "${{ steps.version.outputs.tag }}"
 
-      - name: Download All Artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: dist-merged
-          merge-multiple: true
-
-      - name: Generate Checksums & Release Notes
-        id: notes
+      - name: Generate Release Notes
+        id: release_notes
         shell: bash
         run: |
           TAG="${{ steps.version.outputs.tag }}"
-          mkdir -p dist
-          cp dist-merged/* dist/
-          
-          cd dist
-          sha256sum meta-lattice-* > checksums.txt
-          cat checksums.txt
-          cd ..
-
           cat << 'EOF' > release_body.md
           ## Meta-Lattice Dual-Flavor Release
 
