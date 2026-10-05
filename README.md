@@ -164,12 +164,19 @@ Builds Windows, Linux, and macOS binaries at high speed without tests, bundles o
   2. **Manual run from the GitHub web UI (`workflow_dispatch`)**:
      Go to the repo's `Actions` tab -> `Release & Publish` -> `Run workflow` (version tag optional).
 
-- **Artifacts (dist/)**:
-  - `meta-lattice-<version>-windows-amd64.zip` (Windows 64-bit)
-  - `meta-lattice-<version>-linux-amd64.tar.gz` (Linux x86_64)
-  - `meta-lattice-<version>-linux-arm64.tar.gz` (Linux ARM64)
-  - `meta-lattice-<version>-darwin-arm64.tar.gz` (macOS Apple Silicon)
-  - `meta-lattice-<version>-darwin-amd64.tar.gz` (macOS Intel)
+- **Artifacts (dist/) - 2 Packages per OS**:
+  - **LatticeDB Native Flavors (CGO + Bundled Shared Library)**:
+    - `meta-lattice-<version>-windows-amd64-latticedb.zip` (Windows 64-bit + `lattice.dll`)
+    - `meta-lattice-<version>-linux-amd64-latticedb.tar.gz` (Linux x86_64 + `liblattice.so`)
+    - `meta-lattice-<version>-linux-arm64-latticedb.tar.gz` (Linux ARM64 + `liblattice.so`)
+    - `meta-lattice-<version>-darwin-arm64-latticedb.tar.gz` (macOS Apple Silicon + `liblattice.dylib`)
+    - `meta-lattice-<version>-darwin-amd64-latticedb.tar.gz` (macOS Intel + `liblattice.dylib`)
+  - **Pure-Go Portable Flavors (Zero-Dependency Standalone)**:
+    - `meta-lattice-<version>-windows-amd64-purego.zip` (Windows 64-bit standalone exe)
+    - `meta-lattice-<version>-linux-amd64-purego.tar.gz` (Linux x86_64 standalone binary)
+    - `meta-lattice-<version>-linux-arm64-purego.tar.gz` (Linux ARM64 standalone binary)
+    - `meta-lattice-<version>-darwin-arm64-purego.tar.gz` (macOS Apple Silicon standalone binary)
+    - `meta-lattice-<version>-darwin-amd64-purego.tar.gz` (macOS Intel standalone binary)
   - `checksums.txt` (SHA256 checksums of all artifacts)
 
 - **Package contents (essential files only)**:

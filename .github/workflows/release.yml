@@ -26,23 +26,60 @@ permissions:
   contents: write
 
 jobs:
-  build-and-publish:
-    name: Build & Publish Release (No Tests)
-    runs-on: ubuntu-latest
+  build:
+    name: Build (${{ matrix.platform.name }})
+    runs-on: ${{ matrix.platform.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: Linux x86_64
+            os: ubuntu-latest
+            target_os: linux
+            target_arch: amd64
+            pkg_format: tar.gz
+            installer: install.sh
+          - name: Linux ARM64
+            os: ubuntu-latest
+            target_os: linux
+            target_arch: arm64
+            pkg_format: tar.gz
+            installer: install.sh
+            cross_cc: aarch64-linux-gnu-gcc
+          - name: macOS Apple Silicon
+            os: macos-latest
+            target_os: darwin
+            target_arch: arm64
+            pkg_format: tar.gz
+            installer: install.sh
+          - name: macOS Intel
+            os: macos-13
+            target_os: darwin
+            target_arch: amd64
+            pkg_format: tar.gz
+            installer: install.sh
+          - name: Windows x86_64
+            os: windows-latest
+            target_os: windows
+            target_arch: amd64
+            pkg_format: zip
+            installer: install.ps1
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          # go.mod tracks a recent toolchain (1.27.x); 'stable' follows it so
-          # GOTOOLCHAIN auto-upgrade always has a new enough base to start from.
           go-version: 'stable'
           cache: false
+
+      - name: Install Linux ARM64 Cross Compiler
+        if: matrix.platform.cross_cc == 'aarch64-linux-gnu-gcc'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
 
       - name: Determine Version
         id: version
@@ -55,53 +92,196 @@ jobs:
           else
             TAG="v1.0.0"
           fi
-          
           if [[ ! "$TAG" =~ ^v ]]; then
             TAG="v${TAG}"
           fi
-          
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Building version: $TAG"
 
-      - name: Build & Package (Windows, Linux, macOS)
+      - name: Build Dual Packages (LatticeDB & Pure-Go)
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.tag }}
+          TARGET_OS: ${{ matrix.platform.target_os }}
+          TARGET_ARCH: ${{ matrix.platform.target_arch }}
+          PKG_FORMAT: ${{ matrix.platform.pkg_format }}
+          INSTALLER: ${{ matrix.platform.installer }}
+          CROSS_CC: ${{ matrix.platform.cross_cc }}
+        run: |
+          COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo 'release')"
+          BUILD_DATE="$(date -u +'%Y-%m-%d')"
+          LDFLAGS="-s -w -X main.Version=${VERSION} -X main.GitCommit=${COMMIT} -X main.BuildDate=${BUILD_DATE}"
+          BIN_NAME="meta-lattice"
+          [ "${TARGET_OS}" = "windows" ] && BIN_NAME="meta-lattice.exe"
+
+          mkdir -p dist/packages
+
+          bundle_files() {
+            local dir="$1"
+            cp README.md "${dir}/"
+            [ -f README.ko.md ] && cp README.ko.md "${dir}/"
+            [ -f README.en.md ] && cp README.en.md "${dir}/"
+            cp LICENSE "${dir}/"
+            cp "${INSTALLER}" "${dir}/"
+            [ -f AGENTS.md ] && cp AGENTS.md "${dir}/"
+            [ -f GEMINI.md ] && cp GEMINI.md "${dir}/"
+            [ -f CLAUDE.md ] && cp CLAUDE.md "${dir}/"
+            [ -f .mcp.json ] && cp .mcp.json "${dir}/"
+            [ -d docs ] && cp -r docs "${dir}/"
+            [ -d commands ] && cp -r commands "${dir}/"
+            [ -d skills ] && cp -r skills "${dir}/"
+            [ -d hooks ] && cp -r hooks "${dir}/"
+            [ -d .agents ] && cp -r .agents "${dir}/"
+            [ -d .claude-plugin ] && cp -r .claude-plugin "${dir}/"
+            [ -d .codex ] && cp -r .codex "${dir}/"
+          }
+
+          compress_package() {
+            local name="$1"
+            if [ "${PKG_FORMAT}" = "zip" ]; then
+              if command -v zip >/dev/null 2>&1; then
+                (cd dist && zip -q -r "packages/${name}.zip" "${name}")
+              elif command -v 7z >/dev/null 2>&1; then
+                (cd dist && 7z a -tzip "packages/${name}.zip" "${name}")
+              else
+                powershell -Command "Compress-Archive -Path 'dist/${name}' -DestinationPath 'dist/packages/${name}.zip'"
+              fi
+            else
+              (cd dist && tar -czf "packages/${name}.tar.gz" "${name}")
+            fi
+            rm -rf "dist/${name}"
+          }
+
+          # -------------------------------------------------------------
+          # 1) Pure-Go Package (Zero external dependencies)
+          # -------------------------------------------------------------
+          PUREGO_NAME="meta-lattice-${VERSION}-${TARGET_OS}-${TARGET_ARCH}-purego"
+          mkdir -p "dist/${PUREGO_NAME}"
+          echo "==> Building Pure-Go binary for ${TARGET_OS}/${TARGET_ARCH}..."
+          CGO_ENABLED=0 GOOS="${TARGET_OS}" GOARCH="${TARGET_ARCH}" \
+            go build -tags nolattice -ldflags="${LDFLAGS}" -o "dist/${PUREGO_NAME}/${BIN_NAME}" ./src
+
+          bundle_files "dist/${PUREGO_NAME}"
+          compress_package "${PUREGO_NAME}"
+
+          # -------------------------------------------------------------
+          # 2) LatticeDB Package (Native CGO + LatticeDB Shared Library)
+          # -------------------------------------------------------------
+          LATTICE_NAME="meta-lattice-${VERSION}-${TARGET_OS}-${TARGET_ARCH}-latticedb"
+          mkdir -p "dist/${LATTICE_NAME}"
+          echo "==> Building LatticeDB Native binary for ${TARGET_OS}/${TARGET_ARCH}..."
+
+          ROOT_ABS="$(pwd)"
+          if [ "${TARGET_OS}" = "windows" ]; then
+            CGO_ENABLED=1 GOOS=windows GOARCH=amd64 \
+            CGO_CFLAGS="-I${ROOT_ABS}/deps/latticedb/include" \
+            CGO_LDFLAGS="-L${ROOT_ABS}/deps/latticedb/lib/windows-amd64 -llattice" \
+              go build -ldflags="${LDFLAGS}" -o "dist/${LATTICE_NAME}/${BIN_NAME}" ./src
+          elif [ "${TARGET_OS}" = "darwin" ]; then
+            CGO_ENABLED=1 GOOS=darwin GOARCH="${TARGET_ARCH}" \
+            CGO_CFLAGS="-I${ROOT_ABS}/deps/latticedb/include" \
+            CGO_LDFLAGS="-L${ROOT_ABS}/deps/latticedb/lib/darwin-${TARGET_ARCH} -llattice -Wl,-rpath,@executable_path" \
+              go build -ldflags="${LDFLAGS}" -o "dist/${LATTICE_NAME}/${BIN_NAME}" ./src
+          else # linux
+            CC_ENV=""
+            [ -n "${CROSS_CC}" ] && CC_ENV="${CROSS_CC}"
+            CC="${CC_ENV:-gcc}" CGO_ENABLED=1 GOOS=linux GOARCH="${TARGET_ARCH}" \
+            CGO_CFLAGS="-I${ROOT_ABS}/deps/latticedb/include" \
+            CGO_LDFLAGS="-L${ROOT_ABS}/deps/latticedb/lib/linux-${TARGET_ARCH} -llattice -Wl,-rpath,\$ORIGIN" \
+              go build -ldflags="${LDFLAGS}" -o "dist/${LATTICE_NAME}/${BIN_NAME}" ./src
+          fi
+
+          # Bundle native shared library (.dll, .so, .dylib)
+          if [ -d "deps/latticedb/lib/${TARGET_OS}-${TARGET_ARCH}" ]; then
+            cp -f "deps/latticedb/lib/${TARGET_OS}-${TARGET_ARCH}/"* "dist/${LATTICE_NAME}/" 2>/dev/null || true
+          fi
+
+          bundle_files "dist/${LATTICE_NAME}"
+          compress_package "${LATTICE_NAME}"
+
+          echo "==> Built packages for ${TARGET_OS}/${TARGET_ARCH}:"
+          ls -lh dist/packages/
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.platform.target_os }}-${{ matrix.platform.target_arch }}
+          path: dist/packages/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Determine Version
+        id: version
         shell: bash
         run: |
-          chmod +x scripts/build-release.sh
-          ./scripts/build-release.sh "${{ steps.version.outputs.tag }}"
+          if [ -n "${{ inputs.tag_name }}" ]; then
+            TAG="${{ inputs.tag_name }}"
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            TAG="v1.0.0"
+          fi
+          if [[ ! "$TAG" =~ ^v ]]; then
+            TAG="v${TAG}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Generate Release Notes Body
-        id: release_notes
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-merged
+          merge-multiple: true
+
+      - name: Generate Checksums & Release Notes
+        id: notes
         shell: bash
         run: |
           TAG="${{ steps.version.outputs.tag }}"
-          CHECKSUMS=$(cat dist/checksums.txt)
+          mkdir -p dist
+          cp dist-merged/* dist/
           
+          cd dist
+          sha256sum meta-lattice-* > checksums.txt
+          cat checksums.txt
+          cd ..
+
           cat << 'EOF' > release_body.md
-          ## Meta-Lattice (Go Native) Release
+          ## Meta-Lattice Dual-Flavor Release
 
-          Standalone, zero-dependency release for **Windows (x86_64)**, **Linux (amd64, arm64)**, and **macOS (Apple Silicon & Intel)**.
+          Each OS target is provided with **two distinct package flavors (2 packages per OS)**:
 
-          ### 📦 Included in each package:
-          - Precompiled standalone binary (`meta-lattice` or `meta-lattice.exe`)
-          - One-click installer (`install.sh` / `install.ps1`)
-          - Agent & IDE integrations (`.agents/`, `.claude-plugin/`, `.codex/`, `.mcp.json`, `AGENTS.md`, `GEMINI.md`, `hooks/`)
-          - Pre-configured skills (`skills/`) and slash commands (`commands/`)
-          - Full documentation and license
+          ### 📦 Package Flavors:
+          1. **`-latticedb` (Native CGO)**:
+             - Powered by official embedded **LatticeDB v0.15.0** property graph database.
+             - Bundles platform-specific native shared library (`lattice.dll` / `liblattice.so` / `liblattice.dylib`).
+             - Features B-Tree indexed persistent graph (`.lattice/knowledge.lattice`) and ultra-fast traversals.
+          2. **`-purego` (Zero-Dependency Standalone)**:
+             - Powered by embedded pure-Go in-memory property graph engine.
+             - Completely self-contained single binary with zero external shared library dependencies.
+             - Ideal for constrained environments, minimal containers, or quick installations.
 
-          ### 🚀 Quick Installation
-          **Linux / macOS:**
-          ```bash
-          tar -xzf meta-lattice-*.tar.gz
-          cd meta-lattice-*
-          ./install.sh
-          ```
-
-          **Windows (PowerShell):**
-          ```powershell
-          Expand-Archive meta-lattice-*-windows-amd64.zip
-          cd meta-lattice-*-windows-amd64
-          powershell -ExecutionPolicy Bypass -File .\install.ps1
-          ```
+          ### 🚀 Available Downloads (2 per OS):
+          - **Windows (x86_64)**:
+            - `meta-lattice-<VERSION>-windows-amd64-latticedb.zip`
+            - `meta-lattice-<VERSION>-windows-amd64-purego.zip`
+          - **Linux (amd64)**:
+            - `meta-lattice-<VERSION>-linux-amd64-latticedb.tar.gz`
+            - `meta-lattice-<VERSION>-linux-amd64-purego.tar.gz`
+          - **Linux (arm64)**:
+            - `meta-lattice-<VERSION>-linux-arm64-latticedb.tar.gz`
+            - `meta-lattice-<VERSION>-linux-arm64-purego.tar.gz`
+          - **macOS Apple Silicon (arm64)**:
+            - `meta-lattice-<VERSION>-darwin-arm64-latticedb.tar.gz`
+            - `meta-lattice-<VERSION>-darwin-arm64-purego.tar.gz`
+          - **macOS Intel (amd64)**:
+            - `meta-lattice-<VERSION>-darwin-amd64-latticedb.tar.gz`
+            - `meta-lattice-<VERSION>-darwin-amd64-purego.tar.gz`
 
           ### 🔐 SHA256 Checksums
           ```text

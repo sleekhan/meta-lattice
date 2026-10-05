@@ -164,12 +164,19 @@ make test DOCKER=0
   2. **GitHub 웹 UI 수동 실행 (`workflow_dispatch`)**:
      GitHub 저장소의 `Actions` 탭 -> `Release & Publish` -> `Run workflow` 클릭 (버전 태그 지정 가능).
 
-- **배포 아티팩트 (dist/)**:
-  - `meta-lattice-<version>-windows-amd64.zip` (윈도우 64비트)
-  - `meta-lattice-<version>-linux-amd64.tar.gz` (리눅스 x86_64)
-  - `meta-lattice-<version>-linux-arm64.tar.gz` (리눅스 ARM64)
-  - `meta-lattice-<version>-darwin-arm64.tar.gz` (macOS Apple Silicon)
-  - `meta-lattice-<version>-darwin-amd64.tar.gz` (macOS Intel)
+- **배포 아티팩트 (dist/) - 각 OS당 2종 패키지 제공**:
+  - **LatticeDB 네이티브 버전 (CGO + 네이티브 공유 라이브러리 번들링)**:
+    - `meta-lattice-<version>-windows-amd64-latticedb.zip` (윈도우 64비트 + `lattice.dll`)
+    - `meta-lattice-<version>-linux-amd64-latticedb.tar.gz` (리눅스 x86_64 + `liblattice.so`)
+    - `meta-lattice-<version>-linux-arm64-latticedb.tar.gz` (리눅스 ARM64 + `liblattice.so`)
+    - `meta-lattice-<version>-darwin-arm64-latticedb.tar.gz` (macOS Apple Silicon + `liblattice.dylib`)
+    - `meta-lattice-<version>-darwin-amd64-latticedb.tar.gz` (macOS Intel + `liblattice.dylib`)
+  - **순수 Go 독립 실행형 버전 (Zero-Dependency Standalone, 순수 Go 모듈)**:
+    - `meta-lattice-<version>-windows-amd64-purego.zip` (윈도우 64비트 단일 exe)
+    - `meta-lattice-<version>-linux-amd64-purego.tar.gz` (리눅스 x86_64 단일 바이너리)
+    - `meta-lattice-<version>-linux-arm64-purego.tar.gz` (리눅스 ARM64 단일 바이너리)
+    - `meta-lattice-<version>-darwin-arm64-purego.tar.gz` (macOS Apple Silicon 단일 바이너리)
+    - `meta-lattice-<version>-darwin-amd64-purego.tar.gz` (macOS Intel 단일 바이너리)
   - `checksums.txt` (전체 아티팩트 SHA256 체크섬)
 
 - **패키지 구성 (필수 파일만 번들링)**:
