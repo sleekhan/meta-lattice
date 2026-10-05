@@ -3,6 +3,10 @@ run-name: "Release and Publish: ${{ inputs.tag_name || github.ref_name }}"
 
 on:
   push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/**'
     tags:
       - 'v*'
   workflow_dispatch:
@@ -30,6 +34,7 @@ jobs:
   build-and-publish:
     name: Build & Publish Release
     runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
 
     steps:
       - name: Checkout Code
