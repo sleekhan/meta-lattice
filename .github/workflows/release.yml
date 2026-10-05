@@ -70,7 +70,7 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "Building version: $TAG"
 
-      - name: Build & Package (10 Packages: LatticeDB & Pure-Go per OS)
+      - name: "Build & Package (10 Packages: LatticeDB & Pure-Go per OS)"
         shell: bash
         run: |
           chmod +x scripts/build-release.sh
