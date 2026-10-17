@@ -158,7 +158,12 @@ cmd_build() {
         out="meta-lattice"
         [ "${goos}" = "windows" ] && out="meta-lattice.exe"
     fi
-    cmd_cross "${goos}" "${goarch}" "${out}"
+    # If host platform has native LatticeDB shared library available, build native
+    if [ "${goos}" = "darwin" ] && [ -f "${ROOT_DIR}/deps/latticedb/lib/darwin-${goarch}/liblattice.dylib" ]; then
+        cmd_native_darwin "${goarch}" "${out}"
+    else
+        cmd_cross "${goos}" "${goarch}" "${out}"
+    fi
 }
 
 cmd_windows() {
@@ -241,9 +246,63 @@ cmd_build_native() {
     goarch="${pair##* }"
     if [ "${goos}" = "windows" ]; then
         cmd_windows_native "${out:-meta-lattice.exe}"
+    elif [ "${goos}" = "darwin" ]; then
+        cmd_native_darwin "${goarch}" "${out:-meta-lattice}"
     else
         cmd_native_linux "${goarch}" "${out:-meta-lattice}"
     fi
+}
+
+cmd_native_darwin() {
+    local arch="${1:-}"
+    local out="${2:-}"
+    ensure_builder
+    if [ -z "${arch}" ]; then
+        local pair
+        pair="$(host_goos_goarch)"
+        arch="${pair##* }"
+    fi
+    if [ -z "${out}" ]; then
+        out="/work/meta-lattice"
+    else
+        out="$(to_work_path "${out}")"
+    fi
+
+    local target_triple="aarch64-macos"
+    if [ "${arch}" = "amd64" ]; then
+        target_triple="x86_64-macos"
+    fi
+
+    echo "==> Docker build: darwin/${arch} -> ${out} (CGO, native LatticeDB)..."
+    # shellcheck disable=SC2086
+    docker run --rm \
+        -v "${ROOT_DIR}:/work" \
+        -v "${CACHE_VOL}:/tmp/gopath" \
+        -w /work \
+        ${DOCKER_USER} \
+        -e HOME=/tmp \
+        -e GOPATH=/tmp/gopath \
+        -e GOCACHE=/tmp/gopath/buildcache \
+        -e GOTOOLCHAIN=auto \
+        -e "CGO_ENABLED=1" \
+        -e "GOOS=darwin" \
+        -e "GOARCH=${arch}" \
+        -e "CC=zig cc -target ${target_triple}" \
+        "${BUILDER_IMAGE}" \
+        sh -c "mkdir -p /tmp/lat-darwin/lib /tmp/lat-darwin/pc \
+          && cp /work/deps/latticedb/lib/darwin-${arch}/* /tmp/lat-darwin/lib/ \
+          && echo 'prefix=/tmp/lat-darwin' > /tmp/lat-darwin/pc/lattice.pc \
+          && echo 'libdir=/tmp/lat-darwin/lib' >> /tmp/lat-darwin/pc/lattice.pc \
+          && echo 'includedir=/work/deps/latticedb/include' >> /tmp/lat-darwin/pc/lattice.pc \
+          && echo 'Name: lattice' >> /tmp/lat-darwin/pc/lattice.pc \
+          && echo 'Description: Embedded knowledge graph' >> /tmp/lat-darwin/pc/lattice.pc \
+          && echo 'Version: 0.15.0' >> /tmp/lat-darwin/pc/lattice.pc \
+          && echo 'Libs: -L\${libdir} -llattice' >> /tmp/lat-darwin/pc/lattice.pc \
+          && echo 'Cflags: -I\${includedir}' >> /tmp/lat-darwin/pc/lattice.pc \
+          && PKG_CONFIG_PATH=/tmp/lat-darwin/pc CGO_LDFLAGS='-Wl,-rpath,@executable_path -L/tmp/lat-darwin/lib' \
+             go build -ldflags='${LDFLAGS}' -o '${out}' /work/src \
+          && cp /work/deps/latticedb/lib/darwin-${arch}/liblattice.dylib \"\$(dirname '${out}')/\" \
+          && ls -lh '${out}'"
 }
 
 cmd_all_flavors() {
@@ -360,6 +419,7 @@ case "${sub}" in
     all-flavors) shift; cmd_all_flavors "$@" ;;
     cross) shift; cmd_cross "$@" ;;
     native-linux) shift; cmd_native_linux "$@" ;;
+    native-darwin) shift; cmd_native_darwin "$@" ;;
     test) shift; cmd_test "$@" ;;
     shell) shift; cmd_shell "$@" ;;
     go) shift; ensure_builder; docker_go -- "$@" ;;
