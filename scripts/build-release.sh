@@ -110,7 +110,7 @@ for target in "${TARGETS[@]}"; do
       "${DOCKER_BUILD}" cross "${OS}" "${ARCH}" "${PUREGO_STAGING}/${BIN_NAME}"
   else
     CGO_ENABLED=0 GOOS="${OS}" GOARCH="${ARCH}" \
-      go build -tags nolattice -ldflags="${LDFLAGS}" -o "${PUREGO_STAGING}/${BIN_NAME}" "${SRC_DIR}"
+      go build -buildvcs=false -tags nolattice -ldflags="${LDFLAGS}" -o "${PUREGO_STAGING}/${BIN_NAME}" "${SRC_DIR}"
   fi
 
   bundle_common_files "${PUREGO_STAGING}" "${INSTALLER}"
@@ -171,18 +171,18 @@ EOF
       PKG_CONFIG_PATH="${TARGET_PKG_CONFIG_PATH}" \
       CGO_LDFLAGS="-Wl,-rpath,@executable_path -Wl,-rpath,${ROOT_DIR} -Wl,-rpath,\$ORIGIN" \
       CGO_ENABLED=1 GOOS="${OS}" GOARCH="${ARCH}" \
-        go build -ldflags="${LDFLAGS}" -o "${LATTICE_STAGING}/${BIN_NAME}" "${SRC_DIR}"
+        go build -buildvcs=false -ldflags="${LDFLAGS}" -o "${LATTICE_STAGING}/${BIN_NAME}" "${SRC_DIR}"
     elif [ "${OS}" = "windows" ] && [ "${ARCH}" = "amd64" ] && command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
       echo "      * Cross-compiling Windows native CGO with MinGW..."
       PKG_CONFIG_PATH="${TARGET_PKG_CONFIG_PATH}" \
       CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC=x86_64-w64-mingw32-gcc \
-        go build -ldflags="${LDFLAGS}" -o "${LATTICE_STAGING}/${BIN_NAME}" "${SRC_DIR}"
+        go build -buildvcs=false -ldflags="${LDFLAGS}" -o "${LATTICE_STAGING}/${BIN_NAME}" "${SRC_DIR}"
     elif [ "${OS}" = "linux" ] && [ "${ARCH}" = "arm64" ] && command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
       echo "      * Cross-compiling Linux ARM64 native CGO with aarch64-linux-gnu-gcc..."
       PKG_CONFIG_PATH="${TARGET_PKG_CONFIG_PATH}" \
       CGO_LDFLAGS="-Wl,-rpath,\$ORIGIN" \
       CGO_ENABLED=1 GOOS=linux GOARCH=arm64 CC=aarch64-linux-gnu-gcc \
-        go build -ldflags="${LDFLAGS}" -o "${LATTICE_STAGING}/${BIN_NAME}" "${SRC_DIR}"
+        go build -buildvcs=false -ldflags="${LDFLAGS}" -o "${LATTICE_STAGING}/${BIN_NAME}" "${SRC_DIR}"
     elif [ "${OS}" = "darwin" ] && command -v zig >/dev/null 2>&1; then
       echo "      * Cross-compiling macOS ${ARCH} native CGO with Zig..."
       TARGET_TRIPLE="aarch64-macos"
@@ -190,6 +190,7 @@ EOF
       PC_DIR="/tmp/lat-darwin-${ARCH}/pc"
       ZIG_CACHE="/tmp/zig-cache-${ARCH}"
       mkdir -p "/tmp/lat-darwin-${ARCH}/lib" "${PC_DIR}" "${ZIG_CACHE}/local" "${ZIG_CACHE}/global"
+      chmod -R 777 "${ZIG_CACHE}"
       cp -f "${ROOT_DIR}/deps/latticedb/lib/darwin-${ARCH}/"* "/tmp/lat-darwin-${ARCH}/lib/"
       cat << EOF > "${PC_DIR}/lattice.pc"
 prefix=/tmp/lat-darwin-${ARCH}
@@ -213,11 +214,11 @@ EOF
       PKG_CONFIG_PATH="${PC_DIR}" \
       CGO_LDFLAGS="-Wl,-rpath,@executable_path -L/tmp/lat-darwin-${ARCH}/lib" \
       CGO_ENABLED=1 GOOS=darwin GOARCH="${ARCH}" CC="${ZCC}" \
-        go build -ldflags="${LDFLAGS}" -o "${LATTICE_STAGING}/${BIN_NAME}" "${SRC_DIR}"
+        go build -buildvcs=false -ldflags="${LDFLAGS}" -o "${LATTICE_STAGING}/${BIN_NAME}" "${SRC_DIR}"
     else
       echo "      * Bundling native shared library with portable engine fallback for ${OS}/${ARCH}..."
       CGO_ENABLED=0 GOOS="${OS}" GOARCH="${ARCH}" \
-        go build -tags nolattice -ldflags="${LDFLAGS}" -o "${LATTICE_STAGING}/${BIN_NAME}" "${SRC_DIR}"
+        go build -buildvcs=false -tags nolattice -ldflags="${LDFLAGS}" -o "${LATTICE_STAGING}/${BIN_NAME}" "${SRC_DIR}"
     fi
   fi
 

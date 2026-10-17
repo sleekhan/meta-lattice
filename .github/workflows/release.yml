@@ -41,9 +41,10 @@ jobs:
           cache: false
 
       - name: Setup Zig (for macOS CGO Cross-Compilation)
-        uses: mlugg/setup-zig@v1
-        with:
-          version: 0.13.0
+        run: |
+          curl -fsSL "https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz" | sudo tar -xJ -C /usr/local
+          sudo ln -sf /usr/local/zig-x86_64-linux-0.16.0/zig /usr/local/bin/zig
+          zig version
 
       - name: Install Build Dependencies
         run: |
