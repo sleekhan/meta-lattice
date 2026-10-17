@@ -564,12 +564,14 @@ func (e *CacheEngine) Sync(force bool) SyncStats {
 		}
 	}
 
-	// Save cache state & DB
-	e.state.LastSync = time.Now().Unix()
-	e.state.GitCommit = e.getGitCommit()
-	e.state.Files = cachedFiles
-	_ = e.saveCacheState()
-	_ = e.db.Save()
+	// Save cache state & DB only if there are changes or force or db is dirty
+	if len(added) > 0 || len(modified) > 0 || len(deleted) > 0 || force || e.db.IsDirty() {
+		e.state.LastSync = time.Now().Unix()
+		e.state.GitCommit = e.getGitCommit()
+		e.state.Files = cachedFiles
+		_ = e.saveCacheState()
+		_ = e.db.Save()
+	}
 
 	elapsedMS := int(time.Since(startTime).Milliseconds())
 	counts := e.db.CountNodesAndEdges()
@@ -584,6 +586,174 @@ func (e *CacheEngine) Sync(force bool) SyncStats {
 		Nodes:         counts,
 		GitCommit:     e.state.GitCommit,
 	}
+}
+
+// SyncTargetFile performs ultra-fast targeted incremental sync for a single file
+// (e.g. from Claude Code's post-tool hook), skipping full-directory scanning.
+func (e *CacheEngine) SyncTargetFile(relPath string) (SyncStats, error) {
+	startTime := time.Now()
+	cleanRel := filepath.ToSlash(filepath.Clean(relPath))
+	cleanRel = strings.TrimPrefix(cleanRel, "./")
+	cleanRel = strings.TrimPrefix(cleanRel, "/")
+
+	if filepath.IsAbs(relPath) {
+		if r, err := filepath.Rel(e.workspaceRoot, relPath); err == nil {
+			cleanRel = filepath.ToSlash(r)
+		}
+	}
+
+	absPath := filepath.Join(e.workspaceRoot, filepath.FromSlash(cleanRel))
+
+	if e.shouldIgnore(cleanRel, false) {
+		return SyncStats{
+			ElapsedMS:   int(time.Since(startTime).Milliseconds()),
+			TotalFiles:  len(e.state.Files),
+			CachedCount: len(e.state.Files),
+			Nodes:       e.db.CountNodesAndEdges(),
+			GitCommit:   e.state.GitCommit,
+		}, nil
+	}
+
+	ext := strings.ToLower(filepath.Ext(cleanRel))
+	if _, ok := SupportedExtensions[ext]; !ok {
+		return SyncStats{
+			ElapsedMS:   int(time.Since(startTime).Milliseconds()),
+			TotalFiles:  len(e.state.Files),
+			CachedCount: len(e.state.Files),
+			Nodes:       e.db.CountNodesAndEdges(),
+			GitCommit:   e.state.GitCommit,
+		}, nil
+	}
+
+	cachedFiles := e.state.Files
+	if cachedFiles == nil {
+		cachedFiles = make(map[string]CacheFileInfo)
+	}
+
+	fi, statErr := os.Stat(absPath)
+	isDeleted := os.IsNotExist(statErr)
+
+	var added, modified, deleted []string
+
+	if isDeleted {
+		if _, exists := cachedFiles[cleanRel]; exists {
+			deleted = append(deleted, cleanRel)
+			e.db.DeleteFileSubnodes(cleanRel)
+			delete(cachedFiles, cleanRel)
+		}
+	} else if statErr == nil {
+		cacheItem, exists := cachedFiles[cleanRel]
+		mtime := fi.ModTime().UnixNano()
+		size := fi.Size()
+
+		if !exists {
+			added = append(added, cleanRel)
+		} else if mtime != cacheItem.Mtime || size != cacheItem.Size {
+			sha := ComputeFileSHA(absPath)
+			if sha != cacheItem.SHA {
+				modified = append(modified, cleanRel)
+			}
+		}
+	}
+
+	if len(added) == 0 && len(modified) == 0 && len(deleted) == 0 {
+		return SyncStats{
+			ElapsedMS:   int(time.Since(startTime).Milliseconds()),
+			TotalFiles:  len(cachedFiles),
+			CachedCount: len(cachedFiles),
+			Nodes:       e.db.CountNodesAndEdges(),
+			GitCommit:   e.state.GitCommit,
+		}, nil
+	}
+
+	// Clean subnodes of modified file before re-parsing
+	for _, rel := range modified {
+		e.db.DeleteFileSubnodes(rel)
+	}
+
+	for _, rel := range append(added, modified...) {
+		sha := ComputeFileSHA(absPath)
+		parsed := e.parseFile(rel, absPath, sha)
+		if parsed != nil {
+			domain := GetDomainFromPath(rel)
+			var nodeIDs []string
+
+			// L1 Module
+			l1Props := parsed.FileNode.ToProperties()
+			e.db.CreateNode(parsed.FileNode.ID, parsed.FileNode.Labels, l1Props)
+			nodeIDs = append(nodeIDs, parsed.FileNode.ID)
+
+			// L2 Classes
+			for _, cls := range parsed.ClassNodes {
+				e.db.CreateNode(cls.ID, cls.Labels, cls.ToProperties())
+				nodeIDs = append(nodeIDs, cls.ID)
+				e.db.CreateEdge(parsed.FileNode.ID, cls.ID, string(models.EdgeContains), nil)
+			}
+
+			// L3 Symbols
+			for _, sym := range parsed.SymbolNodes {
+				e.db.CreateNode(sym.ID, sym.Labels, sym.ToProperties())
+				nodeIDs = append(nodeIDs, sym.ID)
+				e.db.CreateEdge(sym.ParentID, sym.ID, string(models.EdgeContains), nil)
+			}
+
+			// L0 Domain
+			domID := "domain:" + domain
+			if _, ok := e.db.GetNode(domID); !ok {
+				l0 := models.L0DomainNode{
+					ID:          domID,
+					Name:        domain,
+					Path:        domain,
+					Description: "Domain " + domain + " containing modules",
+					ModuleCount: 1,
+					Level:       string(models.LevelL0),
+					Labels:      []string{"L0Domain", "Domain"},
+				}
+				e.db.CreateNode(domID, l0.Labels, l0.ToProperties())
+			}
+			e.db.CreateEdge(domID, parsed.FileNode.ID, string(models.EdgeContains), nil)
+
+			var mtime int64
+			var size int64
+			if fi != nil {
+				mtime = fi.ModTime().UnixNano()
+				size = fi.Size()
+			}
+			cachedFiles[rel] = CacheFileInfo{
+				SHA:         sha,
+				Mtime:       mtime,
+				Size:        size,
+				Domain:      domain,
+				NodeIDs:     nodeIDs,
+				Exports:     parsed.FileNode.Exports,
+				Imports:     parsed.FileNode.ImportPaths,
+				ImportSpecs: parsed.Imports,
+			}
+		}
+	}
+
+	currentFiles := make(map[string]string, len(cachedFiles))
+	for rel := range cachedFiles {
+		currentFiles[rel] = filepath.Join(e.workspaceRoot, filepath.FromSlash(rel))
+	}
+	e.resolveDeltaEdges(added, modified, deleted, currentFiles, cachedFiles)
+
+	e.state.LastSync = time.Now().Unix()
+	e.state.GitCommit = e.getGitCommit()
+	e.state.Files = cachedFiles
+	_ = e.saveCacheState()
+	_ = e.db.Save()
+
+	return SyncStats{
+		ElapsedMS:     int(time.Since(startTime).Milliseconds()),
+		TotalFiles:    len(cachedFiles),
+		AddedCount:    len(added),
+		ModifiedCount: len(modified),
+		DeletedCount:  len(deleted),
+		CachedCount:   len(cachedFiles) - len(added) - len(modified),
+		Nodes:         e.db.CountNodesAndEdges(),
+		GitCommit:     e.state.GitCommit,
+	}, nil
 }
 
 func (e *CacheEngine) resolveDeltaEdges(added, modified, deleted []string, currentFiles map[string]string, cachedFiles map[string]CacheFileInfo) {

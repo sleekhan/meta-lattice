@@ -143,3 +143,74 @@ func TestStaleCacheVersionReindexesAndEmptyDomainRemoved(t *testing.T) {
 		t.Fatal("expected domain:pkg to be removed after deleting last file")
 	}
 }
+
+func TestSyncTargetFileAndDirtyOptimization(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "lattice-test-target-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	fileA := filepath.Join(tmpDir, "a.py")
+	fileB := filepath.Join(tmpDir, "b.py")
+	_ = os.WriteFile(fileA, []byte("def a_func(): return 1\n"), 0644)
+	_ = os.WriteFile(fileB, []byte("def b_func(): return 2\n"), 0644)
+
+	cfg := config.NewLatticeConfig(tmpDir)
+	db := storage.NewGraphStorage(cfg.DBPath)
+	engine := indexer.NewCacheEngine(cfg, db)
+
+	// First sync
+	stats := engine.Sync(false)
+	if stats.AddedCount != 2 {
+		t.Fatalf("expected 2 added, got %d", stats.AddedCount)
+	}
+	if db.IsDirty() {
+		t.Fatal("expected db not dirty after Save")
+	}
+
+	// Repeated sync without changes should not dirty db or re-save
+	stats2 := engine.Sync(false)
+	if stats2.AddedCount != 0 || stats2.ModifiedCount != 0 || stats2.DeletedCount != 0 {
+		t.Fatalf("expected 0 changes on clean sync, got %+v", stats2)
+	}
+	if db.IsDirty() {
+		t.Fatal("expected db to remain not dirty")
+	}
+
+	// Target sync of modified b.py
+	time.Sleep(50 * time.Millisecond)
+	_ = os.WriteFile(fileB, []byte("def b_func(): return 42\ndef b_new(): return 99\n"), 0644)
+
+	tStats, err := engine.SyncTargetFile("b.py")
+	if err != nil {
+		t.Fatalf("SyncTargetFile failed: %v", err)
+	}
+	if tStats.ModifiedCount != 1 {
+		t.Fatalf("expected 1 modified file from SyncTargetFile, got %d", tStats.ModifiedCount)
+	}
+
+	// Verify symbol:b.py:b_new exists in db
+	if _, ok := db.GetNode("symbol:b.py:b_new"); !ok {
+		t.Fatal("expected symbol:b.py:b_new in db after SyncTargetFile")
+	}
+
+	// ReloadIfModified check
+	db2 := storage.NewGraphStorage(cfg.DBPath)
+	if db2.ReloadIfModified() {
+		t.Fatal("expected ReloadIfModified to return false when not modified")
+	}
+
+	// Now modify fileA and sync with engine to write db to disk
+	time.Sleep(50 * time.Millisecond)
+	_ = os.WriteFile(fileA, []byte("def a_func(): return 100\n"), 0644)
+	_, _ = engine.SyncTargetFile("a.py")
+
+	// db2 should detect modification on disk and reload
+	if !db2.ReloadIfModified() {
+		t.Fatal("expected db2.ReloadIfModified to return true after disk change")
+	}
+	if node, ok := db2.GetNode("symbol:b.py:b_new"); !ok || node == nil {
+		t.Fatal("expected db2 to have reloaded new symbol")
+	}
+}

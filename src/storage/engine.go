@@ -25,6 +25,9 @@ type GraphStorage struct {
 	outEdges    map[string][]models.GraphEdge // sourceID -> edges
 	inEdges     map[string][]models.GraphEdge // targetID -> edges
 	bm25        *BM25Index
+	bm25Loaded  bool
+	dirty       bool
+	loadedMtime int64
 }
 
 type serializedState struct {
@@ -78,7 +81,7 @@ func (s *GraphStorage) Load() error {
 
 	// 1. Try loading from native LatticeDB file (.lattice) if it exists
 	if HasNativeLatticeDB {
-		if _, statErr := os.Stat(s.latticePath); statErr == nil {
+		if fi, statErr := os.Stat(s.latticePath); statErr == nil {
 			nodes, outEdges, inEdges, err := loadFromLatticeDB(s.latticePath)
 			if err != nil {
 				return fmt.Errorf("corrupt LatticeDB file: %w", err)
@@ -87,9 +90,9 @@ func (s *GraphStorage) Load() error {
 			s.outEdges = outEdges
 			s.inEdges = inEdges
 			s.bm25.Clear()
-			for _, n := range s.nodes {
-				s.indexNodeBM25(n)
-			}
+			s.bm25Loaded = false
+			s.dirty = false
+			s.loadedMtime = fi.ModTime().UnixNano()
 			return nil
 		}
 	}
@@ -109,10 +112,14 @@ func (s *GraphStorage) Load() error {
 	s.outEdges = make(map[string][]models.GraphEdge)
 	s.inEdges = make(map[string][]models.GraphEdge)
 	s.bm25.Clear()
+	s.bm25Loaded = false
+	s.dirty = false
+	if fi, statErr := os.Stat(s.filePath); statErr == nil {
+		s.loadedMtime = fi.ModTime().UnixNano()
+	}
 
 	for _, n := range state.Nodes {
 		s.nodes[n.ID] = n
-		s.indexNodeBM25(n)
 	}
 
 	for _, e := range state.Edges {
@@ -124,12 +131,23 @@ func (s *GraphStorage) Load() error {
 }
 
 func (s *GraphStorage) Save() error {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !s.dirty {
+		return nil
+	}
 
 	// 1. If native LatticeDB is compiled in, persist exclusively to .lattice
 	if HasNativeLatticeDB {
-		return saveToLatticeDB(s.latticePath, s.nodes, s.outEdges)
+		err := saveToLatticeDB(s.latticePath, s.nodes, s.outEdges)
+		if err == nil {
+			s.dirty = false
+			if fi, statErr := os.Stat(s.latticePath); statErr == nil {
+				s.loadedMtime = fi.ModTime().UnixNano()
+			}
+		}
+		return err
 	}
 
 	// 2. Fallback: Persist to atomic JSON when LatticeDB is not available (e.g. CGO-disabled builds)
@@ -155,7 +173,56 @@ func (s *GraphStorage) Save() error {
 	if err := os.WriteFile(tmpFile, data, 0644); err != nil {
 		return err
 	}
-	return os.Rename(tmpFile, s.filePath)
+	if err := os.Rename(tmpFile, s.filePath); err != nil {
+		return err
+	}
+	s.dirty = false
+	if fi, statErr := os.Stat(s.filePath); statErr == nil {
+		s.loadedMtime = fi.ModTime().UnixNano()
+	}
+	return nil
+}
+
+func (s *GraphStorage) IsDirty() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.dirty
+}
+
+func (s *GraphStorage) ReloadIfModified() bool {
+	activePath := s.filePath
+	if HasNativeLatticeDB {
+		if _, err := os.Stat(s.latticePath); err == nil {
+			activePath = s.latticePath
+		}
+	}
+	fi, err := os.Stat(activePath)
+	if err != nil {
+		return false
+	}
+	s.mu.RLock()
+	curMtime := s.loadedMtime
+	isDirty := s.dirty
+	s.mu.RUnlock()
+
+	if !isDirty && fi.ModTime().UnixNano() != curMtime {
+		_ = s.Load()
+		return true
+	}
+	return false
+}
+
+func (s *GraphStorage) ensureBM25Indexed() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.bm25Loaded {
+		return
+	}
+	s.bm25.Clear()
+	for _, n := range s.nodes {
+		s.indexNodeBM25(n)
+	}
+	s.bm25Loaded = true
 }
 
 func (s *GraphStorage) IsNativeLatticeDB() bool {
@@ -192,6 +259,7 @@ func (s *GraphStorage) CreateNode(id string, labels []string, properties map[str
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	s.dirty = true
 	propsCopy := make(map[string]any, len(properties))
 	for k, v := range properties {
 		propsCopy[k] = v
@@ -205,7 +273,9 @@ func (s *GraphStorage) CreateNode(id string, labels []string, properties map[str
 		Properties: propsCopy,
 	}
 	s.nodes[id] = node
-	s.indexNodeBM25(node)
+	if s.bm25Loaded {
+		s.indexNodeBM25(node)
+	}
 }
 
 func (s *GraphStorage) GetNode(id string) (map[string]any, bool) {
@@ -227,8 +297,11 @@ func (s *GraphStorage) DeleteNode(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	s.dirty = true
 	delete(s.nodes, id)
-	s.bm25.RemoveDocument(id)
+	if s.bm25Loaded {
+		s.bm25.RemoveDocument(id)
+	}
 
 	// Remove outgoing edges
 	if outList, ok := s.outEdges[id]; ok {
@@ -284,6 +357,7 @@ func (s *GraphStorage) CreateEdge(sourceID, targetID, edgeType string, propertie
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	s.dirty = true
 	propsCopy := make(map[string]any)
 	for k, v := range properties {
 		propsCopy[k] = v
@@ -328,6 +402,7 @@ func (s *GraphStorage) DeleteEdgesByType(edgeTypes ...string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	s.dirty = true
 	typesSet := make(map[string]bool)
 	for _, t := range edgeTypes {
 		typesSet[t] = true
@@ -359,6 +434,7 @@ func (s *GraphStorage) DeleteEdgesForSource(sourceID string, edgeTypes ...string
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	s.dirty = true
 	typesSet := make(map[string]bool)
 	for _, t := range edgeTypes {
 		typesSet[t] = true
@@ -389,6 +465,7 @@ func (s *GraphStorage) DeleteEdgesForTarget(targetID string, edgeTypes ...string
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	s.dirty = true
 	typesSet := make(map[string]bool)
 	for _, t := range edgeTypes {
 		typesSet[t] = true
@@ -440,7 +517,23 @@ func (s *GraphStorage) GetIncomingEdges(nodeID string, edgeType string) []models
 	return result
 }
 
+func (s *GraphStorage) GetEdgesByType(edgeType string) []models.GraphEdge {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var result []models.GraphEdge
+	for _, edges := range s.outEdges {
+		for _, e := range edges {
+			if edgeType == "" || e.EdgeType == edgeType {
+				result = append(result, e)
+			}
+		}
+	}
+	return result
+}
+
 func (s *GraphStorage) FTSSearch(queryText string, limit int) []map[string]any {
+	s.ensureBM25Indexed()
 	matches := s.bm25.Search(queryText, limit)
 	s.mu.RLock()
 	defer s.mu.RUnlock()

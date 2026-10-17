@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/meta-lattice\" sync"
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/meta-lattice\" hook session-start"
           }
         ]
       }
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/meta-lattice\" sync && \"${CLAUDE_PLUGIN_ROOT}/meta-lattice\" audit"
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/meta-lattice\" hook post-tool"
           }
         ]
       }

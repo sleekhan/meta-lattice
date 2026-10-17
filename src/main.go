@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"meta-lattice/src/config"
 	"meta-lattice/src/features/auditor"
@@ -54,6 +55,8 @@ func main() {
 		runApplyPlan(os.Args[2:])
 	case "mcp":
 		runMCP(os.Args[2:])
+	case "hook":
+		runHook(os.Args[2:])
 	case "install":
 		runInstall(os.Args[2:])
 	case "-h", "--help", "help":
@@ -73,15 +76,17 @@ Usage:
 
 Commands:
   sync                     Synchronize AST cache incrementally using Git SHA / file hash caching
-                           Options: --force, --json
+                           Options: --force, --quiet, --json
+  hook [event]             High-performance Claude Code plugin hook (post-tool, session-start)
+                           Options: --file <path>, --quiet, --json
   status                   Display current LatticeDB index status and graph statistics
                            Options: --json
   zoom <action> [target]   Hierarchical Context Zoom (actions: overview, module, symbol, search)
-                           Options: --json
+                           Options: --no-sync, --json
   audit                    Architecture Boundary Auditor: Check circular dependencies & layer violations
-                           Options: --file <path>, --json
+                           Options: --file <path>, --no-sync, --json
   blast <target>           Blast Radius Estimator: Simulate ripple effects and breaking changes
-                           Options: --type <signature|body|removal|rename>, --hops <n>, --json
+                           Options: --type <signature|body|removal|rename>, --hops <n>, --no-sync, --json
   scaffold                 Code Generation: Create a new module file from a language template
                            Options: --path <file>, --kind <class|interface|struct|enum|module>,
                                    --name <Type>, --namespace <pkg>, --import <a,b>, --overwrite, --json
@@ -132,6 +137,7 @@ func popBoolFlag(args []string, name string) ([]string, bool) {
 func runSync(args []string) {
 	fs := flag.NewFlagSet("sync", flag.ExitOnError)
 	force := fs.Bool("force", false, "Force full re-indexing of all files")
+	quiet := fs.Bool("quiet", false, "Quiet mode: suppress verbose banners")
 	asJSON := fs.Bool("json", false, "Print machine-readable JSON")
 	_ = fs.Parse(args)
 
@@ -139,13 +145,16 @@ func runSync(args []string) {
 	_ = cfg
 	_ = db
 
-	if !*asJSON {
+	if !*asJSON && !*quiet {
 		fmt.Println("Scanning and indexing workspace...")
 	}
 	stats := engine.Sync(*force)
 
 	if *asJSON {
 		printJSON(stats)
+		return
+	}
+	if *quiet {
 		return
 	}
 
@@ -202,6 +211,7 @@ func runStatus(args []string) {
 
 func runZoom(args []string) {
 	args, asJSON := popBoolFlag(args, "json")
+	args, noSync := popBoolFlag(args, "no-sync")
 	action := "overview"
 	target := ""
 	if len(args) > 0 {
@@ -211,7 +221,7 @@ func runZoom(args []string) {
 		target = args[1]
 	}
 
-	_, db, _ := openWorkspace(true)
+	_, db, _ := openWorkspace(!noSync)
 	z := zoomer.NewHierarchicalZoomer(db)
 
 	switch action {
@@ -320,10 +330,11 @@ func runZoom(args []string) {
 func runAudit(args []string) {
 	fs := flag.NewFlagSet("audit", flag.ExitOnError)
 	targetFile := fs.String("file", "", "Specific file path to audit")
+	noSync := fs.Bool("no-sync", false, "Skip automatic pre-audit sync")
 	asJSON := fs.Bool("json", false, "Print machine-readable JSON")
 	_ = fs.Parse(args)
 
-	cfg, db, _ := openWorkspace(true)
+	cfg, db, _ := openWorkspace(!*noSync)
 	aud := auditor.NewArchitectureBoundaryAuditor(db, cfg)
 	res := aud.CheckLayerViolation(*targetFile, nil)
 
@@ -359,6 +370,7 @@ func runAudit(args []string) {
 
 func runBlast(args []string) {
 	args, asJSON := popBoolFlag(args, "json")
+	args, noSync := popBoolFlag(args, "no-sync")
 	if len(args) == 0 {
 		fmt.Println("Error: Target symbol or path is required for 'blast'.")
 		return
@@ -379,7 +391,7 @@ func runBlast(args []string) {
 		}
 	}
 
-	_, db, _ := openWorkspace(true)
+	_, db, _ := openWorkspace(!noSync)
 	bl := blast.NewBlastRadiusEstimator(db)
 	res := bl.EstimateBlastRadius(target, changeType, hops)
 
@@ -585,4 +597,110 @@ func runInstall(args []string) {
 
 	fmt.Println("\n[✓] Meta-Lattice installation complete!")
 	inst.CheckStatus()
+}
+
+func runHook(args []string) {
+	hookEvent := "post-tool"
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		hookEvent = args[0]
+		args = args[1:]
+	}
+
+	fs := flag.NewFlagSet("hook", flag.ExitOnError)
+	targetFileFlag := fs.String("file", "", "Specific target file to sync and audit")
+	asJSON := fs.Bool("json", false, "Print machine-readable JSON")
+	quiet := fs.Bool("quiet", false, "Quiet mode: print only when violations/errors are found")
+	_ = fs.Parse(args)
+
+	switch hookEvent {
+	case "session-start", "SessionStart":
+		_, _, engine := openWorkspace(false)
+		stats := engine.Sync(false)
+		if *asJSON {
+			printJSON(stats)
+		} else if !*quiet {
+			fmt.Printf("[✓] Meta-Lattice: Session initialized, %d files indexed (%d ms)\n", stats.TotalFiles, stats.ElapsedMS)
+		}
+		return
+
+	case "post-tool", "post-edit", "PostToolUse":
+		targetFile := *targetFileFlag
+
+		// Check if Claude Code piped JSON payload via stdin
+		if targetFile == "" {
+			if stat, err := os.Stdin.Stat(); err == nil && (stat.Mode()&os.ModeCharDevice) == 0 {
+				data, _ := io.ReadAll(io.LimitReader(os.Stdin, 512*1024))
+				if len(data) > 0 {
+					var payload struct {
+						ToolName  string `json:"tool_name"`
+						ToolInput struct {
+							FilePath   string `json:"file_path"`
+							Path       string `json:"path"`
+							TargetFile string `json:"target_file"`
+						} `json:"tool_input"`
+					}
+					if err := json.Unmarshal(data, &payload); err == nil {
+						if payload.ToolInput.FilePath != "" {
+							targetFile = payload.ToolInput.FilePath
+						} else if payload.ToolInput.Path != "" {
+							targetFile = payload.ToolInput.Path
+						} else if payload.ToolInput.TargetFile != "" {
+							targetFile = payload.ToolInput.TargetFile
+						}
+					}
+				}
+			}
+		}
+
+		cfg, db, engine := openWorkspace(false)
+		startTime := time.Now()
+		var syncStats indexer.SyncStats
+		if targetFile != "" {
+			syncStats, _ = engine.SyncTargetFile(targetFile)
+		} else {
+			syncStats = engine.Sync(false)
+		}
+
+		aud := auditor.NewArchitectureBoundaryAuditor(db, cfg)
+		auditRes := aud.CheckLayerViolation(targetFile, nil)
+		elapsed := int(time.Since(startTime).Milliseconds())
+
+		if *asJSON {
+			printJSON(map[string]any{
+				"sync":    syncStats,
+				"audit":   auditRes,
+				"elapsed": elapsed,
+			})
+			return
+		}
+
+		status, _ := auditRes["status"].(string)
+		violations, _ := auditRes["layer_violations"].([]map[string]any)
+		cycles, _ := auditRes["circular_dependencies"].([]map[string]any)
+
+		if status == "VIOLATIONS_DETECTED" || len(violations) > 0 || len(cycles) > 0 {
+			fmt.Printf("\n[!] Meta-Lattice Architectural Alert (%d ms):\n", elapsed)
+			for _, v := range violations {
+				fmt.Printf("  • Forbidden Import: %s -> %s (%s -> %s)\n", v["source_file"], v["target_file"], v["source_layer"], v["target_layer"])
+				if r, ok := v["reason"].(string); ok && r != "" {
+					fmt.Printf("    Reason: %s\n", r)
+				}
+			}
+			for _, c := range cycles {
+				fmt.Printf("  • Circular Dependency: %s\n", c["display_chain"])
+			}
+			return
+		}
+
+		if !*quiet {
+			if targetFile != "" {
+				fmt.Printf("[✓] Meta-Lattice: %s synced & architecture verified (%d ms)\n", targetFile, elapsed)
+			} else {
+				fmt.Printf("[✓] Meta-Lattice: Incremental AST synced & architecture verified (%d ms)\n", elapsed)
+			}
+		}
+
+	default:
+		fmt.Printf("Unknown hook event: %s\n", hookEvent)
+	}
 }

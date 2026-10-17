@@ -52,39 +52,37 @@ func (a *ArchitectureBoundaryAuditor) getModuleGraph() *moduleGraph {
 		}
 	}
 
-	for _, e := range a.db.AllEdges() {
-		if e.EdgeType == string(models.EdgeImports) {
-			srcNode, okSrc := a.db.GetNode(e.SourceID)
-			tgtNode, okTgt := a.db.GetNode(e.TargetID)
-			if okSrc && okTgt {
-				srcPath, _ := srcNode["path"].(string)
-				if srcPath == "" {
-					srcPath = strings.TrimPrefix(e.SourceID, "file:")
-				}
-				tgtPath, _ := tgtNode["path"].(string)
-				if tgtPath == "" {
-					tgtPath = strings.TrimPrefix(e.TargetID, "file:")
-				}
+	for _, e := range a.db.GetEdgesByType(string(models.EdgeImports)) {
+		srcNode, okSrc := a.db.GetNode(e.SourceID)
+		tgtNode, okTgt := a.db.GetNode(e.TargetID)
+		if okSrc && okTgt {
+			srcPath, _ := srcNode["path"].(string)
+			if srcPath == "" {
+				srcPath = strings.TrimPrefix(e.SourceID, "file:")
+			}
+			tgtPath, _ := tgtNode["path"].(string)
+			if tgtPath == "" {
+				tgtPath = strings.TrimPrefix(e.TargetID, "file:")
+			}
 
-				var impNames []string
-				if raw, ok := e.Properties["imported_names"].([]string); ok {
-					impNames = raw
-				} else if rawAny, ok := e.Properties["imported_names"].([]any); ok {
-					for _, item := range rawAny {
-						if str, ok := item.(string); ok {
-							impNames = append(impNames, str)
-						}
+			var impNames []string
+			if raw, ok := e.Properties["imported_names"].([]string); ok {
+				impNames = raw
+			} else if rawAny, ok := e.Properties["imported_names"].([]any); ok {
+				for _, item := range rawAny {
+					if str, ok := item.(string); ok {
+						impNames = append(impNames, str)
 					}
 				}
-
-				medge := moduleEdge{
-					source:        srcPath,
-					target:        tgtPath,
-					importedNames: impNames,
-				}
-				mg.outEdges[srcPath] = append(mg.outEdges[srcPath], medge)
-				mg.inEdges[tgtPath] = append(mg.inEdges[tgtPath], medge)
 			}
+
+			medge := moduleEdge{
+				source:        srcPath,
+				target:        tgtPath,
+				importedNames: impNames,
+			}
+			mg.outEdges[srcPath] = append(mg.outEdges[srcPath], medge)
+			mg.inEdges[tgtPath] = append(mg.inEdges[tgtPath], medge)
 		}
 	}
 

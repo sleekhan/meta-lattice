@@ -71,7 +71,9 @@ func saveToLatticeDB(latticePath string, nodes map[string]*NodeData, outEdges ma
 	_ = os.Remove(tmpPath + "-shm")
 
 	db, err := latticedb.Open(tmpPath, latticedb.OpenOptions{
-		Create: true,
+		Create:               true,
+		CacheSizeMB:          128,
+		EnableAdjacencyCache: true,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create temporary LatticeDB: %w", err)
@@ -80,31 +82,32 @@ func saveToLatticeDB(latticePath string, nodes map[string]*NodeData, outEdges ma
 	nodeIDMap := make(map[string]latticedb.NodeID, len(nodes))
 
 	err = db.Update(func(tx *latticedb.Tx) error {
-		// 1. Create all nodes and set properties
+		// 1. Create all nodes and set properties in batch
 		for _, node := range nodes {
 			labels := node.Labels
 			if len(labels) == 0 {
 				labels = []string{"Node"}
 			}
-			n, err := tx.CreateNode(latticedb.CreateNodeOptions{
-				Labels: labels,
-			})
-			if err != nil {
-				return fmt.Errorf("failed to create node %s: %w", node.ID, err)
-			}
-			nodeIDMap[node.ID] = n.ID
 
-			if err := tx.SetProperty(n.ID, "id", node.ID); err != nil {
-				return err
-			}
+			nodeProps := make(map[string]latticedb.Value, len(node.Properties)+1)
+			nodeProps["id"] = node.ID
 			for k, v := range node.Properties {
 				if k == "id" {
 					continue
 				}
 				if lv := toLatticeValue(v); lv != nil {
-					_ = tx.SetProperty(n.ID, k, lv)
+					nodeProps[k] = lv
 				}
 			}
+
+			n, err := tx.CreateNode(latticedb.CreateNodeOptions{
+				Labels:     labels,
+				Properties: nodeProps,
+			})
+			if err != nil {
+				return fmt.Errorf("failed to create node %s: %w", node.ID, err)
+			}
+			nodeIDMap[node.ID] = n.ID
 		}
 
 		// 2. Create all edges
@@ -184,8 +187,10 @@ func loadFromLatticeDB(latticePath string) (map[string]*NodeData, map[string][]m
 	}
 
 	db, err := latticedb.Open(latticePath, latticedb.OpenOptions{
-		Create:   false,
-		ReadOnly: true,
+		Create:               false,
+		ReadOnly:             true,
+		CacheSizeMB:          128,
+		EnableAdjacencyCache: true,
 	})
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to open LatticeDB %s: %w", latticePath, err)
@@ -216,11 +221,9 @@ func loadFromLatticeDB(latticePath string) (map[string]*NodeData, map[string][]m
 			labels = lblListStr
 		}
 
-		props := make(map[string]any)
-		if propMap, ok := row["props"].(map[string]any); ok {
-			for k, v := range propMap {
-				props[k] = v
-			}
+		props, ok := row["props"].(map[string]any)
+		if !ok || props == nil {
+			props = make(map[string]any)
 		}
 
 		nodes[idStr] = &NodeData{
@@ -247,11 +250,9 @@ func loadFromLatticeDB(latticePath string) (map[string]*NodeData, map[string][]m
 			continue
 		}
 
-		props := make(map[string]any)
-		if propMap, ok := row["props"].(map[string]any); ok {
-			for k, v := range propMap {
-				props[k] = v
-			}
+		props, ok := row["props"].(map[string]any)
+		if !ok || props == nil {
+			props = make(map[string]any)
 		}
 
 		edge := models.GraphEdge{

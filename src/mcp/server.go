@@ -345,6 +345,8 @@ func (s *MCPServer) ensureIndexed() {
 }
 
 func (s *MCPServer) callTool(name string, args map[string]any) (string, error) {
+	s.db.ReloadIfModified()
+
 	switch name {
 	case "zoom_module", "zoom_symbol", "zoom_search", "check_layer_violation", "estimate_blast_radius":
 		s.ensureIndexed()
