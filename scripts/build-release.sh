@@ -188,7 +188,8 @@ EOF
       TARGET_TRIPLE="aarch64-macos"
       [ "${ARCH}" = "amd64" ] && TARGET_TRIPLE="x86_64-macos"
       PC_DIR="/tmp/lat-darwin-${ARCH}/pc"
-      mkdir -p "/tmp/lat-darwin-${ARCH}/lib" "${PC_DIR}"
+      ZIG_CACHE="/tmp/zig-cache-${ARCH}"
+      mkdir -p "/tmp/lat-darwin-${ARCH}/lib" "${PC_DIR}" "${ZIG_CACHE}/local" "${ZIG_CACHE}/global"
       cp -f "${ROOT_DIR}/deps/latticedb/lib/darwin-${ARCH}/"* "/tmp/lat-darwin-${ARCH}/lib/"
       cat << EOF > "${PC_DIR}/lattice.pc"
 prefix=/tmp/lat-darwin-${ARCH}
@@ -200,9 +201,18 @@ Version: 0.15.0
 Libs: -L\${libdir} -llattice
 Cflags: -I\${includedir}
 EOF
+      ZCC="/tmp/lat-darwin-${ARCH}/zcc"
+      cat << EOF > "${ZCC}"
+#!/bin/sh
+export ZIG_LOCAL_CACHE_DIR="${ZIG_CACHE}/local"
+export ZIG_GLOBAL_CACHE_DIR="${ZIG_CACHE}/global"
+exec zig cc -target ${TARGET_TRIPLE} "\$@"
+EOF
+      chmod +x "${ZCC}"
+
       PKG_CONFIG_PATH="${PC_DIR}" \
       CGO_LDFLAGS="-Wl,-rpath,@executable_path -L/tmp/lat-darwin-${ARCH}/lib" \
-      CGO_ENABLED=1 GOOS=darwin GOARCH="${ARCH}" CC="zig cc -target ${TARGET_TRIPLE}" \
+      CGO_ENABLED=1 GOOS=darwin GOARCH="${ARCH}" CC="${ZCC}" \
         go build -ldflags="${LDFLAGS}" -o "${LATTICE_STAGING}/${BIN_NAME}" "${SRC_DIR}"
     else
       echo "      * Bundling native shared library with portable engine fallback for ${OS}/${ARCH}..."
