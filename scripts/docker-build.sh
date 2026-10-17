@@ -303,6 +303,21 @@ cmd_native_darwin() {
              go build -ldflags='${LDFLAGS}' -o '${out}' /work/src \
           && cp /work/deps/latticedb/lib/darwin-${arch}/liblattice.dylib \"\$(dirname '${out}')/\" \
           && ls -lh '${out}'"
+
+    if [ "$(uname -s)" = "Darwin" ]; then
+        local host_bin
+        if [[ "${out}" = /work/* ]]; then
+            host_bin="${ROOT_DIR}/${out#/work/}"
+        else
+            host_bin="${out}"
+        fi
+        local host_dir
+        host_dir="$(dirname "${host_bin}")"
+        if command -v codesign >/dev/null 2>&1; then
+            [ -f "${host_dir}/liblattice.dylib" ] && codesign --force --sign - "${host_dir}/liblattice.dylib" 2>/dev/null || true
+            [ -f "${host_bin}" ] && codesign --force --sign - "${host_bin}" 2>/dev/null || true
+        fi
+    fi
 }
 
 cmd_all_flavors() {

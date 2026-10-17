@@ -127,6 +127,12 @@ func (s *GraphStorage) Load() error {
 		s.inEdges[e.TargetID] = append(s.inEdges[e.TargetID], e)
 	}
 
+	if HasNativeLatticeDB {
+		// Loaded from fallback JSON but native LatticeDB is available:
+		// mark dirty to auto-migrate to .lattice on next save.
+		s.dirty = true
+	}
+
 	return nil
 }
 
@@ -145,6 +151,10 @@ func (s *GraphStorage) Save() error {
 			s.dirty = false
 			if fi, statErr := os.Stat(s.latticePath); statErr == nil {
 				s.loadedMtime = fi.ModTime().UnixNano()
+			}
+			// Clean up legacy fallback JSON file once migrated to native LatticeDB
+			if s.filePath != s.latticePath {
+				_ = os.Remove(s.filePath)
 			}
 		}
 		return err

@@ -132,6 +132,9 @@ for target in "${TARGETS[@]}"; do
     elif [ "${OS}" = "linux" ] && [ "${ARCH}" = "${CONTAINER_ARCH}" ]; then
       BUILDER_IMAGE="${BUILDER_IMAGE}" VERSION="${VERSION}" \
         "${DOCKER_BUILD}" native-linux "${ARCH}" "${LATTICE_STAGING}/${BIN_NAME}"
+    elif [ "${OS}" = "darwin" ]; then
+      BUILDER_IMAGE="${BUILDER_IMAGE}" VERSION="${VERSION}" \
+        "${DOCKER_BUILD}" native-darwin "${ARCH}" "${LATTICE_STAGING}/${BIN_NAME}"
     else
       # If cross-CGO not directly available in docker, build with library bundle
       echo "      * Using portable binary with native library bundle for ${OS}-${ARCH}..."
