@@ -48,6 +48,11 @@ jobs:
           go-version: 'stable'
           cache: false
 
+      - name: Setup Zig (for macOS CGO Cross-Compilation)
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
+
       - name: Install Build Dependencies
         run: |
           sudo apt-get update

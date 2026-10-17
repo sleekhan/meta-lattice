@@ -183,6 +183,27 @@ EOF
       CGO_LDFLAGS="-Wl,-rpath,\$ORIGIN" \
       CGO_ENABLED=1 GOOS=linux GOARCH=arm64 CC=aarch64-linux-gnu-gcc \
         go build -ldflags="${LDFLAGS}" -o "${LATTICE_STAGING}/${BIN_NAME}" "${SRC_DIR}"
+    elif [ "${OS}" = "darwin" ] && command -v zig >/dev/null 2>&1; then
+      echo "      * Cross-compiling macOS ${ARCH} native CGO with Zig..."
+      TARGET_TRIPLE="aarch64-macos"
+      [ "${ARCH}" = "amd64" ] && TARGET_TRIPLE="x86_64-macos"
+      PC_DIR="/tmp/lat-darwin-${ARCH}/pc"
+      mkdir -p "/tmp/lat-darwin-${ARCH}/lib" "${PC_DIR}"
+      cp -f "${ROOT_DIR}/deps/latticedb/lib/darwin-${ARCH}/"* "/tmp/lat-darwin-${ARCH}/lib/"
+      cat << EOF > "${PC_DIR}/lattice.pc"
+prefix=/tmp/lat-darwin-${ARCH}
+libdir=/tmp/lat-darwin-${ARCH}/lib
+includedir=${ROOT_DIR}/deps/latticedb/include
+Name: lattice
+Description: Embedded knowledge graph
+Version: 0.15.0
+Libs: -L\${libdir} -llattice
+Cflags: -I\${includedir}
+EOF
+      PKG_CONFIG_PATH="${PC_DIR}" \
+      CGO_LDFLAGS="-Wl,-rpath,@executable_path -L/tmp/lat-darwin-${ARCH}/lib" \
+      CGO_ENABLED=1 GOOS=darwin GOARCH="${ARCH}" CC="zig cc -target ${TARGET_TRIPLE}" \
+        go build -ldflags="${LDFLAGS}" -o "${LATTICE_STAGING}/${BIN_NAME}" "${SRC_DIR}"
     else
       echo "      * Bundling native shared library with portable engine fallback for ${OS}/${ARCH}..."
       CGO_ENABLED=0 GOOS="${OS}" GOARCH="${ARCH}" \
