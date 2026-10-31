@@ -58,14 +58,14 @@ func (c *Codegen) resolvePath(relPath string) (string, string, error) {
 	if err != nil {
 		return "", "", fmt.Errorf("resolve workspace root: %w", err)
 	}
-	parentReal, err := filepath.EvalSymlinks(filepath.Dir(abs))
-	if err != nil && !os.IsNotExist(err) {
-		return "", "", fmt.Errorf("resolve target directory: %w", err)
+	// Resolve symlinks in the deepest existing ancestor too: a directory that
+	// does not exist yet would otherwise skip the check and let MkdirAll /
+	// WriteFile follow a symlink out of the workspace.
+	targetReal, err := resolveExistingPath(abs)
+	if err != nil {
+		return "", "", fmt.Errorf("resolve target path: %w", err)
 	}
-	if err == nil && parentReal != rootReal && !strings.HasPrefix(parentReal, rootReal+string(os.PathSeparator)) {
-		return "", "", fmt.Errorf("path %q escapes workspace through symlink", relPath)
-	}
-	if targetReal, err := filepath.EvalSymlinks(abs); err == nil && targetReal != rootReal && !strings.HasPrefix(targetReal, rootReal+string(os.PathSeparator)) {
+	if targetReal != rootReal && !strings.HasPrefix(targetReal, rootReal+string(os.PathSeparator)) {
 		return "", "", fmt.Errorf("path %q escapes workspace through symlink", relPath)
 	}
 	ext := strings.ToLower(filepath.Ext(rel))
@@ -73,6 +73,32 @@ func (c *Codegen) resolvePath(relPath string) (string, string, error) {
 		return "", "", fmt.Errorf("extension %q is not an indexed source file", ext)
 	}
 	return abs, rel, nil
+}
+
+// resolveExistingPath resolves symlinks in the deepest existing ancestor of abs
+// and re-appends the not-yet-created trailing segments, so workspace
+// containment can be verified for files that do not exist yet.
+func resolveExistingPath(abs string) (string, error) {
+	existing := abs
+	var trailing []string
+	for {
+		if _, err := os.Lstat(existing); err == nil {
+			break
+		} else if !os.IsNotExist(err) {
+			return "", err
+		}
+		parent := filepath.Dir(existing)
+		if parent == existing {
+			return "", fmt.Errorf("no existing ancestor for %q", abs)
+		}
+		trailing = append([]string{filepath.Base(existing)}, trailing...)
+		existing = parent
+	}
+	resolved, err := filepath.EvalSymlinks(existing)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(append([]string{resolved}, trailing...)...), nil
 }
 
 func languageOf(rel string) string {
@@ -215,7 +241,7 @@ func (c *Codegen) ApplyPlan(ops []PlanOperation, dryRun bool) (map[string]any, e
 			"failed":   idx,
 			"error":    fmt.Sprintf(format, args...),
 			"results":  results,
-			"rollback": true,
+			"rollback": len(undos) > 0,
 		}, fmt.Errorf(format, args...)
 	}
 
