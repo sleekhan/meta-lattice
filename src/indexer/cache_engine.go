@@ -51,15 +51,23 @@ var SupportedExtensions = map[string]string{
 	".hpp":    "cpp",
 }
 
+type CachedSymbol struct {
+	ID    string   `json:"id"`
+	Name  string   `json:"name"`
+	Calls []string `json:"calls,omitempty"`
+}
+
 type CacheFileInfo struct {
-	SHA         string       `json:"sha"`
-	Mtime       int64        `json:"mtime"`
-	Size        int64        `json:"size"`
-	Domain      string       `json:"domain"`
-	NodeIDs     []string     `json:"node_ids"`
-	Exports     []string     `json:"exports"`
-	Imports     []string     `json:"imports"`
-	ImportSpecs []ImportSpec `json:"import_specs"`
+	SHA            string         `json:"sha"`
+	Mtime          int64          `json:"mtime"`
+	Size           int64          `json:"size"`
+	Domain         string         `json:"domain"`
+	NodeIDs        []string       `json:"node_ids"`
+	Exports        []string       `json:"exports"`
+	Imports        []string       `json:"imports"`
+	ImportSpecs    []ImportSpec   `json:"import_specs"`
+	Symbols        []CachedSymbol `json:"symbols,omitempty"`
+	SymbolsIndexed bool           `json:"symbols_indexed,omitempty"`
 }
 
 type CacheState struct {
@@ -657,22 +665,30 @@ func (e *CacheEngine) Sync(force bool) SyncStats {
 			}
 
 			// L3 Symbols
+			var cachedSymbols []CachedSymbol
 			for _, sym := range res.SymbolNodes {
 				sProps := sym.ToProperties()
 				e.db.CreateNode(sym.ID, sym.Labels, sProps)
 				nodeIDs = append(nodeIDs, sym.ID)
 				e.db.CreateEdge(sym.ParentID, sym.ID, string(models.EdgeContains), nil)
+				cachedSymbols = append(cachedSymbols, CachedSymbol{
+					ID:    sym.ID,
+					Name:  sym.Name,
+					Calls: sym.Calls,
+				})
 			}
 
 			cachedFiles[pr.rel] = CacheFileInfo{
-				SHA:         pr.sha,
-				Mtime:       pr.mtime,
-				Size:        pr.size,
-				Domain:      domain,
-				NodeIDs:     nodeIDs,
-				Exports:     res.FileNode.Exports,
-				Imports:     res.FileNode.ImportPaths,
-				ImportSpecs: res.Imports,
+				SHA:            pr.sha,
+				Mtime:          pr.mtime,
+				Size:           pr.size,
+				Domain:         domain,
+				NodeIDs:        nodeIDs,
+				Exports:        res.FileNode.Exports,
+				Imports:        res.FileNode.ImportPaths,
+				ImportSpecs:    res.Imports,
+				Symbols:        cachedSymbols,
+				SymbolsIndexed: true,
 			}
 		}
 	}
@@ -697,14 +713,12 @@ func (e *CacheEngine) Sync(force bool) SyncStats {
 	// have drifted apart, so drop L0 nodes that no longer own any file.
 	if force {
 		var stale []string
-		e.db.RangeNodes(func(id string, props map[string]any) {
-			if lvl, _ := props["level"].(string); lvl != string(models.LevelL0) {
-				return
-			}
-			if name, _ := props["name"].(string); domainCounts[name] == 0 {
+		for _, props := range e.db.QueryNodes(string(models.LevelL0), "", 0) {
+			id, _ := props["id"].(string)
+			if name, _ := props["name"].(string); domainCounts[name] == 0 && id != "" {
 				stale = append(stale, id)
 			}
-		})
+		}
 		e.db.DeleteNodes(stale)
 	}
 
@@ -735,8 +749,8 @@ func (e *CacheEngine) Sync(force bool) SyncStats {
 			for _, info := range cachedFiles {
 				allImportSpecs = append(allImportSpecs, info.ImportSpecs...)
 			}
-			e.resolveImportEdges(allImportSpecs, currentFiles)
-			e.resolveAllCallEdges()
+			importedMap := e.resolveImportEdgesFiltered(allImportSpecs, currentFiles, nil)
+			e.resolveAllCallEdgesWithContext(cachedFiles, importedMap)
 		} else {
 			// Localized Delta Rebuild: Only resolve affected files and callers
 			e.resolveDeltaEdges(added, modified, deleted, currentFiles, cachedFiles)
@@ -938,10 +952,16 @@ func (e *CacheEngine) SyncTargetFile(target string) (SyncStats, error) {
 			}
 
 			// L3 Symbols
+			var cachedSymbols []CachedSymbol
 			for _, sym := range parsed.SymbolNodes {
 				e.db.CreateNode(sym.ID, sym.Labels, sym.ToProperties())
 				nodeIDs = append(nodeIDs, sym.ID)
 				e.db.CreateEdge(sym.ParentID, sym.ID, string(models.EdgeContains), nil)
+				cachedSymbols = append(cachedSymbols, CachedSymbol{
+					ID:    sym.ID,
+					Name:  sym.Name,
+					Calls: sym.Calls,
+				})
 			}
 
 			// L0 Domain nodes are refreshed after the loop: their module_count
@@ -953,14 +973,16 @@ func (e *CacheEngine) SyncTargetFile(target string) (SyncStats, error) {
 				size = fi.Size()
 			}
 			cachedFiles[rel] = CacheFileInfo{
-				SHA:         sha,
-				Mtime:       mtime,
-				Size:        size,
-				Domain:      domain,
-				NodeIDs:     nodeIDs,
-				Exports:     parsed.FileNode.Exports,
-				Imports:     parsed.FileNode.ImportPaths,
-				ImportSpecs: parsed.Imports,
+				SHA:            sha,
+				Mtime:          mtime,
+				Size:           size,
+				Domain:         domain,
+				NodeIDs:        nodeIDs,
+				Exports:        parsed.FileNode.Exports,
+				Imports:        parsed.FileNode.ImportPaths,
+				ImportSpecs:    parsed.Imports,
+				Symbols:        cachedSymbols,
+				SymbolsIndexed: true,
 			}
 		}
 	}
@@ -1031,6 +1053,18 @@ func (e *CacheEngine) SyncTargetFile(target string) (SyncStats, error) {
 	return stats, nil
 }
 
+func allSymbolsCached(cachedFiles map[string]CacheFileInfo) bool {
+	if len(cachedFiles) == 0 {
+		return false
+	}
+	for _, info := range cachedFiles {
+		if !info.SymbolsIndexed {
+			return false
+		}
+	}
+	return true
+}
+
 func (e *CacheEngine) resolveDeltaEdges(added, modified, deleted []string, currentFiles map[string]string, cachedFiles map[string]CacheFileInfo) {
 	dirtyFiles := make(map[string]bool)
 	for _, f := range added {
@@ -1050,12 +1084,13 @@ func (e *CacheEngine) resolveDeltaEdges(added, modified, deleted []string, curre
 		e.db.DeleteEdgesForTarget(fileID, string(models.EdgeImports))
 	}
 
-	// Re-resolve IMPORTS across cachedFiles (very fast, string-based)
+	// Re-resolve IMPORTS across cachedFiles (very fast, string-based), only
+	// writing edges connected to dirtyFiles so untouched files are not dirtied.
 	var allImportSpecs []ImportSpec
 	for _, info := range cachedFiles {
 		allImportSpecs = append(allImportSpecs, info.ImportSpecs...)
 	}
-	e.resolveImportEdges(allImportSpecs, currentFiles)
+	importedMap := e.resolveImportEdgesFiltered(allImportSpecs, currentFiles, dirtyFiles)
 
 	// 2. Identify all symbol names defined in added / modified files
 	modifiedSymbolNames := make(map[string]bool)
@@ -1064,14 +1099,26 @@ func (e *CacheEngine) resolveDeltaEdges(added, modified, deleted []string, curre
 			for _, symName := range info.Exports {
 				modifiedSymbolNames[symName] = true
 			}
-			for _, nodeID := range info.NodeIDs {
-				if strings.HasPrefix(nodeID, "symbol:") {
-					if n, ok := e.db.GetNode(nodeID); ok {
-						if name, _ := n["name"].(string); name != "" {
-							if idx := strings.LastIndex(name, "."); idx != -1 {
-								name = name[idx+1:]
+			if info.SymbolsIndexed {
+				for _, sym := range info.Symbols {
+					name := sym.Name
+					if idx := strings.LastIndex(name, "."); idx != -1 {
+						name = name[idx+1:]
+					}
+					if name != "" {
+						modifiedSymbolNames[name] = true
+					}
+				}
+			} else {
+				for _, nodeID := range info.NodeIDs {
+					if strings.HasPrefix(nodeID, "symbol:") {
+						if n, ok := e.db.GetNode(nodeID); ok {
+							if name, _ := n["name"].(string); name != "" {
+								if idx := strings.LastIndex(name, "."); idx != -1 {
+									name = name[idx+1:]
+								}
+								modifiedSymbolNames[name] = true
 							}
-							modifiedSymbolNames[name] = true
 						}
 					}
 				}
@@ -1086,6 +1133,26 @@ func (e *CacheEngine) resolveDeltaEdges(added, modified, deleted []string, curre
 	dirtySet := make(map[string]bool)
 	for _, rel := range append(added, modified...) {
 		dirtySet[rel] = true
+	}
+
+	if allSymbolsCached(cachedFiles) {
+		for rel, info := range cachedFiles {
+			isDirtyFile := dirtySet[rel]
+			for _, sym := range info.Symbols {
+				for _, c := range sym.Calls {
+					if isDirtyFile || modifiedSymbolNames[c] {
+						deltaCallSpecs = append(deltaCallSpecs, CallSpec{
+							CallerID:   sym.ID,
+							CalledName: c,
+						})
+					}
+				}
+			}
+		}
+		if len(deltaCallSpecs) > 0 {
+			e.resolveCallEdgesWithContext(deltaCallSpecs, cachedFiles, importedMap)
+		}
+		return
 	}
 
 	e.db.RangeNodes(func(id string, props map[string]any) {
@@ -1122,6 +1189,25 @@ func (e *CacheEngine) resolveDeltaEdges(added, modified, deleted []string, curre
 	}
 }
 
+func (e *CacheEngine) resolveAllCallEdgesWithContext(cachedFiles map[string]CacheFileInfo, importedMap map[string]map[string]bool) {
+	if allSymbolsCached(cachedFiles) {
+		var allCallSpecs []CallSpec
+		for _, info := range cachedFiles {
+			for _, sym := range info.Symbols {
+				for _, c := range sym.Calls {
+					allCallSpecs = append(allCallSpecs, CallSpec{
+						CallerID:   sym.ID,
+						CalledName: c,
+					})
+				}
+			}
+		}
+		e.resolveCallEdgesWithContext(allCallSpecs, cachedFiles, importedMap)
+		return
+	}
+	e.resolveAllCallEdges()
+}
+
 func (e *CacheEngine) resolveAllCallEdges() {
 	var allCallSpecs []CallSpec
 	e.db.RangeNodes(func(id string, props map[string]any) {
@@ -1150,6 +1236,10 @@ func (e *CacheEngine) resolveAllCallEdges() {
 }
 
 func (e *CacheEngine) resolveImportEdges(imports []ImportSpec, currentFiles map[string]string) {
+	e.resolveImportEdgesFiltered(imports, currentFiles, nil)
+}
+
+func (e *CacheEngine) resolveImportEdgesFiltered(imports []ImportSpec, currentFiles map[string]string, dirtyFiles map[string]bool) map[string]map[string]bool {
 	exts := []string{
 		"", ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".svelte", ".go",
 		".java", ".kt", ".kts", ".cs", ".swift", ".php",
@@ -1346,37 +1436,72 @@ func (e *CacheEngine) resolveImportEdges(imports []ImportSpec, currentFiles map[
 		}
 	}
 
+	importedMap := make(map[string]map[string]bool, len(edges))
 	for k, props := range edges {
-		e.db.CreateEdge("file:"+k.src, "file:"+k.tgt, string(models.EdgeImports), props)
+		set, ok := importedMap[k.src]
+		if !ok {
+			set = make(map[string]bool)
+			importedMap[k.src] = set
+		}
+		set[k.tgt] = true
+		if dirtyFiles == nil || dirtyFiles[k.src] || dirtyFiles[k.tgt] {
+			e.db.CreateEdge("file:"+k.src, "file:"+k.tgt, string(models.EdgeImports), props)
+		}
 	}
+	return importedMap
 }
 
 func (e *CacheEngine) resolveCallEdges(calls []CallSpec) {
+	e.resolveCallEdgesWithContext(calls, nil, nil)
+}
+
+func (e *CacheEngine) resolveCallEdgesWithContext(calls []CallSpec, cachedFiles map[string]CacheFileInfo, precomputedImports map[string]map[string]bool) {
+	if len(calls) == 0 {
+		return
+	}
 	// Group L3 symbols by their short name (e.g. AuthService.login -> login, or
-	// login -> login). Only the two properties the resolver needs are kept, so
-	// the graph does not have to hand out a copy of every node's property map.
+	// login -> login). When cachedFiles has symbol metadata, build the table
+	// directly without hydrating or scanning the graph database.
 	type symbolMeta struct {
 		filePath string
 		name     string
 	}
 	byName := make(map[string][]string)
 	meta := make(map[string]symbolMeta)
-	e.db.RangeNodes(func(id string, props map[string]any) {
-		if lvl, _ := props["level"].(string); lvl != string(models.LevelL3) {
-			return
+
+	if cachedFiles != nil && allSymbolsCached(cachedFiles) {
+		for rel, info := range cachedFiles {
+			for _, sym := range info.Symbols {
+				fullName := sym.Name
+				shortName := fullName
+				if idx := strings.LastIndex(fullName, "."); idx != -1 {
+					shortName = fullName[idx+1:]
+				}
+				byName[shortName] = append(byName[shortName], sym.ID)
+				meta[sym.ID] = symbolMeta{filePath: rel, name: fullName}
+			}
 		}
-		fullName, _ := props["name"].(string)
-		shortName := fullName
-		if idx := strings.LastIndex(fullName, "."); idx != -1 {
-			shortName = fullName[idx+1:]
-		}
-		byName[shortName] = append(byName[shortName], id)
-		fPath, _ := props["file_path"].(string)
-		meta[id] = symbolMeta{filePath: fPath, name: fullName}
-	})
+	} else {
+		e.db.RangeNodes(func(id string, props map[string]any) {
+			if lvl, _ := props["level"].(string); lvl != string(models.LevelL3) {
+				return
+			}
+			fullName, _ := props["name"].(string)
+			shortName := fullName
+			if idx := strings.LastIndex(fullName, "."); idx != -1 {
+				shortName = fullName[idx+1:]
+			}
+			byName[shortName] = append(byName[shortName], id)
+			fPath, _ := props["file_path"].(string)
+			meta[id] = symbolMeta{filePath: fPath, name: fullName}
+		})
+	}
 
 	importedMap := make(map[string]map[string]bool)
 	getImportedFiles := func(filePath string) map[string]bool {
+		if precomputedImports != nil {
+			return precomputedImports[filePath]
+		}
 		if files, ok := importedMap[filePath]; ok {
 			return files
 		}

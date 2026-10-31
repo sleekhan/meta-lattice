@@ -76,24 +76,33 @@ Meta-Lattice incorporates a **2-tier cache engine combining SHA-256 content hash
 - `audit` and `blast` took ~0.15s and ~0.11s respectively on the same dataset (including process startup and DB loading).
 - Scenarios involving branch switches with dozens of changed files on very large repositories have not been profiled.
 
-#### Incremental persistence (write path)
+#### Incremental persistence & on-demand lazy native execution (v2 schema)
 
-`GraphStorage` journals the **final intent** of every node and edge touched since the last successful save, then replays that delta into the existing `.lattice` file in one LatticeDB transaction ([`backend_latticedb.go`](../src/storage/backend_latticedb.go)). Only an initial or forced sync (and a few recovery cases) rewrites the file from scratch.
+`GraphStorage` combines a **packed v2 property schema (`_p` JSON payload + indexed scalar keys)** with **on-demand native LatticeDB query execution (`lazyNative` mode)** and a **mutation journal** ([`backend_latticedb.go`](../src/storage/backend_latticedb.go), [`engine.go`](../src/storage/engine.go)):
 
-> 📏 **Measurement Environment**: `meta-lattice sync` inside the Linux/arm64 builder container, synthetic Python workspace (5 functions per file, 20 packages). The graph file was 51 MB at 1,000 files (6,021 nodes / 6,001 edges) and 154 MB at 3,000 files (18,021 nodes / 18,001 edges).
+1. **Packed v2 Property Layout**: Each node stores its full property map in `"_p"` (compact JSON bytes) alongside only the scalar keys backed by B-Tree or FTS indexes (`"id"`, `"name"`, `"path"`, `"short_name"`, `"search_text"`). This reduces per-node B-Tree property writes by ~6× and speeds up initial full indexing on 3,000 files from 141 s to ~20.1 s.
+2. **On-Demand Lazy Native Execution**: Opening `GraphStorage` probes the `.lattice` v2 metadata (`__meta` stream offsets) in ~26.7 ms without loading all nodes and edges into memory. Point queries, symbol/module lookups, BM25 FTS searches, edge traversals, status counts, and single-file hook syncs execute directly against LatticeDB's native C APIs (`FindNodesByLabelProperty`, `GetNodesByLabel`, `FTSSearch`, `GetOutgoingEdgesByType`, `GetIncomingEdgesByType`, `GetStreamOffset`) with an automatic read-only handle lease cache and neighbor prefix prefetching.
+3. **Incremental Mutation Journal**: Only the final intent of nodes and edges touched since the last save is replayed into the existing `.lattice` file in a single transaction, keeping `total_edges` in `__meta` synchronized without a full rewrite.
 
-| Scenario | Save cost (graph write) | Whole command |
-| :--- | :--- | :--- |
-| One file edited, 1,000 files | **~23 ms** (journal replay) | ~1.07 s |
-| One file edited, 3,000 files | **~62 ms** (journal replay) | ~3.24 s |
-| No changes | 0 ms (no write) | ~1.04 s / ~3.24 s |
-| Initial or forced sync | full rewrite | dominated by parsing |
+> 📏 **Measurement Environment**: Linux/arm64 builder container, synthetic 3,000-file Go workspace (20 packages × 150 files, 15,020 nodes, 24,000 edges). Each cold measurement opens a fresh `GraphStorage` instance against the persisted `.lattice` file.
 
-- The remaining per-command cost is loading the graph into memory (open + two Cypher scans: ~1.0 s at 6k nodes, ~3.2 s at 18k nodes), not persistence.
+| Scenario (3,000 files / 15,020 nodes / 24,000 edges) | Previous (v1 Eager Cypher + Full Rewrite) | Current (v2 Packed + Lazy Native + Journal) | Speedup |
+| :--- | :--- | :--- | :--- |
+| **Initial full sync (`Sync(true)`)** | ~141.0 s | **~20.06 s** | **7.0×** |
+| **Cold `NewGraphStorage` startup** | ~3,650 ms (full Cypher load) | **~26.7 ms** (metadata probe) | **136×** |
+| **Cold `zoom_symbol`** | ~3,650 ms | **~26.9 ms** | **135×** |
+| **Cold `zoom_module`** | ~3,650 ms | **~27.3 ms** | **133×** |
+| **Cold `estimate_blast_radius`** | ~3,650 ms | **~28.2 ms** | **129×** |
+| **Cold `zoom_search` (native BM25 FTS)** | ~3,650 ms | **~55.5 ms** | **65×** |
+| **Cold `zoom_overview`** | ~3,650 ms | **~111.7 ms** | **32×** |
+| **Cold `check_layer_violation`** | ~3,650 ms | **~113.7 ms** | **32×** |
+| **Cold no-op `Sync(false)`** | ~3,650 ms | **~71.3 ms** | **51×** |
+| **Cold single-file `SyncTargetFile` (hook edit)** | ~17,970 ms (full rewrite) / ~3,650 ms (load) | **~147.4 ms** (`mode=incremental`, 15 ops) | **121×** |
+
 - A full rewrite is still used when: the file does not exist, a sync is forced (`--force`, cache version change, drift), the delta exceeds `max(2000, (nodes+edges)/4)` operations, or the file cannot be updated in place (missing indexes, duplicate ids).
 - The replay is idempotent (edge upserts are delete-then-create, because LatticeDB permits duplicate `(source, type, target)` edges) and atomic (a failed transaction leaves the previous file untouched).
 - If another process holds the database lock, the save fails with an explicit error and keeps the pending journal instead of clobbering that writer; the next sync retries.
-- `.lattice/cache_state.json` stores the persisted node/edge counts. If they no longer match the graph, the next sync rebuilds instead of applying a delta to a stale base.
+- `.lattice/cache_state.json` stores the persisted node/edge counts and per-file symbol metadata (`CachedSymbol`) so delta `CALLS` and `IMPORTS` edges are resolved in $O(\Delta)$ without scanning the full graph.
 
 > ⚡ **Operational Behavior**: If query tools (`zoom_*`, `check_layer_violation`, `estimate_blast_radius`) are called while the index is empty, Meta-Lattice builds the index automatically on the first call. To sync subsequent code modifications, call `sync_index` (or `meta-lattice sync`). CLI commands `zoom`/`audit`/`blast` execute incremental sync automatically before querying.
 

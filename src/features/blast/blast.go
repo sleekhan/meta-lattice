@@ -46,20 +46,7 @@ func (b *BlastRadiusEstimator) resolveTargetNodes(symbolOrPath string) []map[str
 	}
 
 	// 3. Symbol name match
-	var matches []map[string]any
-	b.db.RangeNodes(func(id string, d map[string]any) {
-		name, _ := d["name"].(string)
-		if name != symbolOrPath && !strings.HasSuffix(name, "."+symbolOrPath) {
-			return
-		}
-		cp := make(map[string]any, len(d)+1)
-		for k, v := range d {
-			cp[k] = v
-		}
-		cp["id"] = id
-		matches = append(matches, cp)
-	})
-	return matches
+	return b.db.FindSymbolsByName(symbolOrPath, "")
 }
 
 type queueItem struct {

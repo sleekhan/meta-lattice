@@ -123,3 +123,34 @@ func TestRangeNodesDoesNotCopyProperties(t *testing.T) {
 		t.Fatalf("expected 1 node, got %d", seen)
 	}
 }
+
+func TestFindSymbolsByNameAndSecondaryIndexes(t *testing.T) {
+	db := newTestStorage(t)
+	db.CreateNode("file:pkg/a.py", []string{"L1Module"}, map[string]any{
+		"level": string(models.LevelL1), "path": "pkg/a.py", "domain": "pkg",
+	})
+	db.CreateNode("symbol:pkg/a.py:AuthService.login", []string{"L3Symbol"}, map[string]any{
+		"level": string(models.LevelL3), "name": "AuthService.login", "file_path": "pkg/a.py",
+	})
+	db.CreateNode("symbol:pkg/b.py:login", []string{"L3Symbol"}, map[string]any{
+		"level": string(models.LevelL3), "name": "login", "file_path": "pkg/b.py",
+	})
+
+	if got := db.FindNodesByLabelProperty("L1Module", "path", "pkg/a.py", 1); len(got) != 1 {
+		t.Fatalf("expected 1 module by path index, got %d", len(got))
+	}
+	if got := db.FindSymbolsByName("login", ""); len(got) != 2 {
+		t.Fatalf("expected 2 symbols matching short name 'login', got %d", len(got))
+	}
+	if got := db.FindSymbolsByName("login", "pkg/a.py"); len(got) != 1 {
+		t.Fatalf("expected 1 symbol matching 'login' in pkg/a.py, got %d", len(got))
+	}
+	if got := db.FindSymbolsByName("AuthService.login", ""); len(got) != 1 {
+		t.Fatalf("expected 1 symbol matching qualified name 'AuthService.login', got %d", len(got))
+	}
+
+	db.DeleteNode("symbol:pkg/a.py:AuthService.login")
+	if got := db.FindSymbolsByName("login", ""); len(got) != 1 {
+		t.Fatalf("deleted symbol remained in secondary index, got %d", len(got))
+	}
+}

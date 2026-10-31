@@ -269,29 +269,12 @@ func (z *HierarchicalZoomer) ZoomSymbol(symbolNameOrID string, filePath string) 
 	}
 
 	if targetNode == nil {
-		// Query by symbol name. Only the matched node is copied out of the graph.
-		z.db.RangeNodes(func(id string, d map[string]any) {
-			if targetNode != nil {
-				return
+		for _, cand := range z.db.FindSymbolsByName(symbolNameOrID, filePath) {
+			if lvl, _ := cand["level"].(string); lvl == string(models.LevelL3) {
+				targetNode = cand
+				break
 			}
-			if lvl, _ := d["level"].(string); lvl != string(models.LevelL3) {
-				return
-			}
-			name, _ := d["name"].(string)
-			if name != symbolNameOrID && !strings.HasSuffix(name, "."+symbolNameOrID) {
-				return
-			}
-			fPath, _ := d["file_path"].(string)
-			if filePath != "" && fPath != filePath {
-				return
-			}
-			cp := make(map[string]any, len(d)+1)
-			for k, v := range d {
-				cp[k] = v
-			}
-			cp["id"] = id
-			targetNode = cp
-		})
+		}
 	}
 
 	if targetNode == nil {

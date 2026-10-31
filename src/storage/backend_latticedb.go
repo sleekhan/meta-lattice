@@ -3,11 +3,14 @@
 package storage
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	latticedb "github.com/jeffhajewski/latticedb/bindings/go"
@@ -15,6 +18,18 @@ import (
 )
 
 const HasNativeLatticeDB = true
+
+// latticeSchemaVersion identifies the packed v2 property layout stored in the
+// "__meta" stream offset table. Databases with version 2 store a node's full
+// property map in "_p" (compact JSON bytes) alongside only the scalar keys
+// backed by B-Tree or FTS indexes, cutting B-Tree page writes by ~6x and
+// enabling sub-millisecond on-demand queries without full-graph hydration.
+const (
+	latticeMetaStream    = "__meta"
+	latticeMetaSchemaKey = "schema_version"
+	latticeMetaEdgesKey  = "total_edges"
+	latticeSchemaVersion = uint64(2)
+)
 
 // identityIndexLabels are the node labels that carry the stable string id.
 // FindNodesByLabelProperty only answers for an explicitly indexed
@@ -28,7 +43,7 @@ const (
 )
 
 // identityLabel picks the level label (L0Domain..L3Symbol) of a node. Labels
-// such as "File" or "Function" are decorative and are not indexed.
+// such as "File" or "Function" are decorative and are preserved inside "_p".
 func identityLabel(labels []string) string {
 	for _, label := range labels {
 		for _, known := range identityIndexLabels {
@@ -40,31 +55,219 @@ func identityLabel(labels []string) string {
 	return ""
 }
 
-// nodePropertyMap converts our node to LatticeDB properties. "id" is always
-// written from the stable string id so a node cannot be indexed under a stale
-// value.
-func nodePropertyMap(id string, properties map[string]any) map[string]latticedb.Value {
-	props := make(map[string]latticedb.Value, len(properties)+1)
-	props["id"] = id
+func labelFromID(id string) string {
+	switch {
+	case strings.HasPrefix(id, "domain:"):
+		return "L0Domain"
+	case strings.HasPrefix(id, "file:"):
+		return "L1Module"
+	case strings.HasPrefix(id, "class:"):
+		return "L2Class"
+	case strings.HasPrefix(id, "symbol:"):
+		return "L3Symbol"
+	default:
+		return ""
+	}
+}
+
+func candidateLabelsForID(id string) []string {
+	if lbl := labelFromID(id); lbl != "" {
+		return []string{lbl}
+	}
+	return identityIndexLabels
+}
+
+func labelForLevel(level string) string {
+	switch level {
+	case string(models.LevelL0), "L0Domain":
+		return "L0Domain"
+	case string(models.LevelL1), "L1Module":
+		return "L1Module"
+	case string(models.LevelL2), "L2Class":
+		return "L2Class"
+	case string(models.LevelL3), "L3Symbol":
+		return "L3Symbol"
+	default:
+		return ""
+	}
+}
+
+// nodePropertyMap converts a node to its packed LatticeDB v2 properties. Only
+// the indexed scalar keys ("id", "name", "path", "short_name", "search_text")
+// and the packed JSON payload ("_p") are stored as B-Tree properties.
+func nodePropertyMap(id string, labels []string, properties map[string]any) map[string]latticedb.Value {
+	fullProps := make(map[string]any, len(properties)+2)
 	for k, v := range properties {
-		if k == "id" {
-			continue
+		fullProps[k] = v
+	}
+	fullProps["id"] = id
+	if len(labels) > 0 {
+		fullProps["labels"] = labels
+	}
+
+	packed, _ := json.Marshal(fullProps)
+	props := make(map[string]latticedb.Value, 6)
+	props["id"] = id
+	props["_p"] = packed
+	props["search_text"] = buildNodeSearchText(fullProps)
+
+	primary := identityLabel(labels)
+	if primary == "" {
+		primary = labelFromID(id)
+	}
+	name, _ := fullProps["name"].(string)
+	pathVal, _ := fullProps["path"].(string)
+
+	switch primary {
+	case "L0Domain":
+		props["name"] = name
+		if pathVal != "" {
+			props["path"] = pathVal
 		}
-		if lv := toLatticeValue(v); lv != nil {
-			props[k] = lv
+	case "L1Module":
+		props["path"] = pathVal
+	case "L2Class":
+		props["name"] = name
+	case "L3Symbol":
+		props["name"] = name
+		props["short_name"] = shortSymbolName(name)
+	default:
+		if name != "" {
+			props["name"] = name
+			props["short_name"] = shortSymbolName(name)
+		}
+		if pathVal != "" {
+			props["path"] = pathVal
 		}
 	}
 	return props
 }
 
 func edgePropertyMap(properties map[string]any) map[string]latticedb.Value {
-	props := make(map[string]latticedb.Value, len(properties))
-	for k, v := range properties {
-		if lv := toLatticeValue(v); lv != nil {
-			props[k] = lv
+	if len(properties) == 0 {
+		return nil
+	}
+	packed, err := json.Marshal(properties)
+	if err != nil {
+		return nil
+	}
+	return map[string]latticedb.Value{"_p": packed}
+}
+
+func unpackPropsValue(val latticedb.Value) (map[string]any, bool) {
+	var raw []byte
+	switch v := val.(type) {
+	case []byte:
+		raw = v
+	case string:
+		raw = []byte(v)
+	default:
+		return nil, false
+	}
+	if len(raw) == 0 {
+		return nil, false
+	}
+	props, err := unmarshalPropsJSON(raw)
+	if err != nil || props == nil {
+		return nil, false
+	}
+	return props, true
+}
+
+func extractLabels(raw any, primaryLabel string) []string {
+	switch v := raw.(type) {
+	case []string:
+		if len(v) > 0 {
+			return v
+		}
+	case []any:
+		var out []string
+		for _, item := range v {
+			if s, ok := item.(string); ok && s != "" {
+				out = append(out, s)
+			}
+		}
+		if len(out) > 0 {
+			return out
 		}
 	}
-	return props
+	if primaryLabel != "" {
+		return []string{primaryLabel}
+	}
+	return nil
+}
+
+func readNodeDataFromTx(tx *latticedb.Tx, nid latticedb.NodeID, primaryLabel string) (*NodeData, bool) {
+	if val, ok, err := tx.GetProperty(nid, "_p"); err == nil && ok {
+		if props, ok := unpackPropsValue(val); ok {
+			idStr, _ := props["id"].(string)
+			if idStr == "" {
+				if idVal, okID, errID := tx.GetProperty(nid, "id"); errID == nil && okID {
+					idStr, _ = idVal.(string)
+				}
+			}
+			if idStr == "" {
+				return nil, false
+			}
+			labels := extractLabels(props["labels"], primaryLabel)
+			props["id"] = idStr
+			if len(labels) > 0 {
+				props["labels"] = labels
+			}
+			return &NodeData{
+				ID:         idStr,
+				Labels:     labels,
+				Properties: props,
+			}, true
+		}
+	}
+
+	// Legacy v1 node fallback (no "_p" property).
+	idVal, ok, err := tx.GetProperty(nid, "id")
+	if err != nil || !ok {
+		return nil, false
+	}
+	idStr, _ := idVal.(string)
+	if idStr == "" {
+		return nil, false
+	}
+	props := map[string]any{"id": idStr}
+	for _, key := range []string{"level", "name", "path", "file_path", "loc", "module_count", "language", "layer", "docstring", "kind", "signature", "code", "is_public", "cyclomatic_complexity", "line_start", "line_end", "exports", "calls", "bases", "method_signatures", "field_signatures", "description", "domain"} {
+		if v, exists, err := tx.GetProperty(nid, key); err == nil && exists {
+			props[key] = normalizeNumeric(v)
+		}
+	}
+	if primaryLabel == "" {
+		primaryLabel = labelFromID(idStr)
+	}
+	labels := extractLabels(props["labels"], primaryLabel)
+	if len(labels) > 0 {
+		props["labels"] = labels
+	}
+	return &NodeData{
+		ID:         idStr,
+		Labels:     labels,
+		Properties: props,
+	}, true
+}
+
+func readEdgePropsFromTx(tx *latticedb.Tx, edgeID latticedb.EdgeID) map[string]any {
+	if val, ok, err := tx.GetEdgeProperty(edgeID, "_p"); err == nil && ok {
+		if props, ok := unpackPropsValue(val); ok {
+			return props
+		}
+	}
+	return make(map[string]any)
+}
+
+func resolveNodeIDInTx(tx *latticedb.Tx, id string) (latticedb.NodeID, string, bool) {
+	for _, lbl := range candidateLabelsForID(id) {
+		ids, err := tx.FindNodesByLabelProperty(lbl, "id", id, 1)
+		if err == nil && len(ids) > 0 {
+			return ids[0], lbl, true
+		}
+	}
+	return 0, "", false
 }
 
 // splitEdgeKey reverses edgeKey(source, type, target).
@@ -102,23 +305,59 @@ func openLatticeWithRetry(path string, opts latticedb.OpenOptions) (*latticedb.D
 	return nil, fmt.Errorf("%w: %v", errDatabaseLocked, err)
 }
 
-// ensureIdentityIndexes makes sure the (label, "id") indexes the journal replay
-// relies on exist. Indexes persist in the file, so this is a no-op after the
+// probeLatticeDB verifies that the database file can be opened and checks
+// whether it uses the packed v2 schema (which supports lazy on-demand queries).
+func probeLatticeDB(latticePath string) (bool, error) {
+	if _, err := os.Stat(latticePath); err != nil {
+		return false, err
+	}
+	var isV2 bool
+	err := withReadOnlyDB(latticePath, 8, func(db *latticedb.DB) error {
+		ver, ok, err := db.GetStreamOffset(latticeMetaStream, latticeMetaSchemaKey)
+		if err != nil {
+			return fmt.Errorf("failed to read LatticeDB metadata: %w", err)
+		}
+		if _, err := db.GetNodesByLabel("L1Module"); err != nil {
+			return fmt.Errorf("failed to read LatticeDB label index: %w", err)
+		}
+		isV2 = ok && ver == latticeSchemaVersion
+		return nil
+	})
+	if err != nil {
+		return false, fmt.Errorf("failed to open LatticeDB %s: %w", latticePath, err)
+	}
+	if !isV2 {
+		closeCachedReadOnlyDB()
+	}
+	return isV2, nil
+}
+
+func ignoreAlreadyExists(err error) error {
+	if err == nil || errors.Is(err, &latticedb.Error{Code: latticedb.ErrorAlreadyExists}) {
+		return nil
+	}
+	return err
+}
+
+// ensureIdentityIndexes makes sure the (label, "id"), secondary property, and
+// FTS indexes exist. Indexes persist in the file, so this is a no-op after the
 // first save; a database that cannot be indexed at all is rebuilt instead.
 func ensureIdentityIndexes(db *latticedb.DB) error {
 	for _, label := range identityIndexLabels {
 		err := db.CreateNodePropertyIndex(label, "id")
-		if err == nil {
-			continue
+		if err != nil && !errors.Is(err, &latticedb.Error{Code: latticedb.ErrorAlreadyExists}) {
+			if errors.Is(err, &latticedb.Error{Code: latticedb.ErrorUnsupported}) {
+				return fmt.Errorf("%w: identity indexes unsupported: %v", errIncrementalUnavailable, err)
+			}
+			return fmt.Errorf("%w: create %s index: %v", errIncrementalUnavailable, label, err)
 		}
-		if errors.Is(err, &latticedb.Error{Code: latticedb.ErrorAlreadyExists}) {
-			continue
-		}
-		if errors.Is(err, &latticedb.Error{Code: latticedb.ErrorUnsupported}) {
-			return fmt.Errorf("%w: identity indexes unsupported: %v", errIncrementalUnavailable, err)
-		}
-		return fmt.Errorf("%w: create %s index: %v", errIncrementalUnavailable, label, err)
+		_ = ignoreAlreadyExists(db.CreateNodeFTSIndex(label, "search_text"))
 	}
+	_ = ignoreAlreadyExists(db.CreateNodePropertyIndex("L0Domain", "name"))
+	_ = ignoreAlreadyExists(db.CreateNodePropertyIndex("L1Module", "path"))
+	_ = ignoreAlreadyExists(db.CreateNodePropertyIndex("L2Class", "name"))
+	_ = ignoreAlreadyExists(db.CreateNodePropertyIndex("L3Symbol", "name"))
+	_ = ignoreAlreadyExists(db.CreateNodePropertyIndex("L3Symbol", "short_name"))
 	return nil
 }
 
@@ -156,18 +395,7 @@ func (r *nodeResolver) labelFor(id string) string {
 			}
 		}
 	}
-	switch {
-	case strings.HasPrefix(id, "domain:"):
-		return "L0Domain"
-	case strings.HasPrefix(id, "file:"):
-		return "L1Module"
-	case strings.HasPrefix(id, "class:"):
-		return "L2Class"
-	case strings.HasPrefix(id, "symbol:"):
-		return "L3Symbol"
-	default:
-		return ""
-	}
+	return labelFromID(id)
 }
 
 // resolve looks an id up by (label, id). An id that appears under more than one
@@ -216,10 +444,11 @@ func applyJournalToLatticeDB(latticePath string, journal *graphJournal, nodes ma
 	if journal == nil || journal.ops() == 0 {
 		return nil
 	}
+	closeCachedReadOnlyDB()
 
 	db, err := openLatticeWithRetry(latticePath, latticedb.OpenOptions{
 		Create:               false,
-		CacheSizeMB:          128,
+		CacheSizeMB:          16,
 		EnableAdjacencyCache: true,
 	})
 	if err != nil {
@@ -231,8 +460,25 @@ func applyJournalToLatticeDB(latticePath string, journal *graphJournal, nodes ma
 		return err
 	}
 
+	ver, hasVer, _ := db.GetStreamOffset(latticeMetaStream, latticeMetaSchemaKey)
+	baseEdges, hasEdges, _ := db.GetStreamOffset(latticeMetaStream, latticeMetaEdgesKey)
+	trackEdges := hasVer && ver == latticeSchemaVersion && hasEdges
+
 	err = db.Update(func(tx *latticedb.Tx) error {
-		return applyJournalTx(tx, journal, nodes)
+		edgeDelta, txErr := applyJournalTx(tx, journal, nodes)
+		if txErr != nil {
+			return txErr
+		}
+		if trackEdges {
+			updated := int64(baseEdges) + edgeDelta
+			if updated < 0 {
+				updated = 0
+			}
+			if err := tx.SetStreamOffset(latticeMetaStream, latticeMetaEdgesKey, uint64(updated)); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 	if err == nil {
 		return nil
@@ -250,9 +496,10 @@ func applyJournalToLatticeDB(latticePath string, journal *graphJournal, nodes ma
 
 // applyJournalTx applies the journal in dependency order: edge removals first
 // (so no edge is left dangling), then node removals, node upserts and finally
-// edge upserts.
-func applyJournalTx(tx *latticedb.Tx, journal *graphJournal, nodes map[string]*NodeData) error {
+// edge upserts. It returns the net change in edge count.
+func applyJournalTx(tx *latticedb.Tx, journal *graphJournal, nodes map[string]*NodeData) (int64, error) {
 	resolver := newNodeResolver(tx, journal, nodes)
+	var edgeDelta int64
 
 	deleting := make(map[string]struct{})
 	for id, mutation := range journal.nodes {
@@ -271,7 +518,7 @@ func applyJournalTx(tx *latticedb.Tx, journal *graphJournal, nodes map[string]*N
 	for key, mutation := range journal.edges {
 		source, typ, target, ok := splitEdgeKey(key)
 		if !ok {
-			return fmt.Errorf("%w: malformed edge key %q", errIncrementalUnavailable, key)
+			return 0, fmt.Errorf("%w: malformed edge key %q", errIncrementalUnavailable, key)
 		}
 		edgeOps = append(edgeOps, edgeOp{source: source, target: target, typ: typ, mut: mutation})
 	}
@@ -306,43 +553,60 @@ func applyJournalTx(tx *latticedb.Tx, journal *graphJournal, nodes map[string]*N
 		}
 		sourceID, ok, err := resolver.resolve(op.source)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		if !ok {
 			continue
 		}
 		targetID, ok, err := resolver.resolve(op.target)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		if !ok {
 			continue
 		}
-		if err := tx.DeleteEdge(sourceID, targetID, op.typ); err != nil && !isNotFound(err) {
-			return err
+		if err := tx.DeleteEdge(sourceID, targetID, op.typ); err != nil {
+			if !isNotFound(err) {
+				return 0, err
+			}
+		} else {
+			edgeDelta--
 		}
 	}
 
-	// 2. Node removals. LatticeDB does not cascade, but every incident edge was
-	// journaled by DeleteNode, so the graph stays consistent.
+	// 2. Node removals. LatticeDB does not cascade; also purge any remaining
+	// incident edges on disk before removing the node itself.
 	for id, mutation := range journal.nodes {
 		if !mutation.delete {
 			continue
 		}
 		nodeID, ok, err := resolver.resolve(id)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		if !ok {
 			continue
 		}
+		if out, err := tx.GetOutgoingEdges(nodeID); err == nil {
+			for _, e := range out {
+				if err := tx.DeleteEdge(e.SourceID, e.TargetID, e.Type); err == nil {
+					edgeDelta--
+				}
+			}
+		}
+		if inc, err := tx.GetIncomingEdges(nodeID); err == nil {
+			for _, e := range inc {
+				if err := tx.DeleteEdge(e.SourceID, e.TargetID, e.Type); err == nil {
+					edgeDelta--
+				}
+			}
+		}
 		if err := tx.DeleteNode(nodeID); err != nil && !isNotFound(err) {
-			return err
+			return 0, err
 		}
 	}
 
-	// 3. Node upserts. Every node kind writes a fixed property key set, so
-	// overwriting each key is enough; LatticeDB has no property removal API.
+	// 3. Node upserts.
 	for id, mutation := range journal.nodes {
 		if mutation.delete {
 			continue
@@ -351,26 +615,30 @@ func applyJournalTx(tx *latticedb.Tx, journal *graphJournal, nodes map[string]*N
 		if !ok {
 			continue
 		}
-		props := nodePropertyMap(id, node.Properties)
+		labels := node.Labels
+		if len(labels) == 0 {
+			labels = mutation.labels
+		}
+		props := nodePropertyMap(id, labels, node.Properties)
 
 		nodeID, exists, err := resolver.resolve(id)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		if !exists {
-			labels := node.Labels
-			if len(labels) == 0 {
-				labels = mutation.labels
-			}
-			if len(labels) == 0 {
-				labels = []string{"Node"}
+			primary := identityLabel(labels)
+			createLabels := labels
+			if primary != "" {
+				createLabels = []string{primary}
+			} else if len(createLabels) == 0 {
+				createLabels = []string{"Node"}
 			}
 			created, err := tx.CreateNode(latticedb.CreateNodeOptions{
-				Labels:     labels,
+				Labels:     createLabels,
 				Properties: props,
 			})
 			if err != nil {
-				return err
+				return 0, err
 			}
 			resolver.remember(id, created.ID)
 			available[id] = true
@@ -378,7 +646,7 @@ func applyJournalTx(tx *latticedb.Tx, journal *graphJournal, nodes map[string]*N
 		}
 		for key, value := range props {
 			if err := tx.SetProperty(nodeID, key, value); err != nil {
-				return err
+				return 0, err
 			}
 		}
 	}
@@ -391,40 +659,45 @@ func applyJournalTx(tx *latticedb.Tx, journal *graphJournal, nodes map[string]*N
 		}
 		sourceAvailable, err := endpointOK(op.source)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		targetAvailable, err := endpointOK(op.target)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		if !sourceAvailable || !targetAvailable {
 			continue
 		}
 		sourceID, ok, err := resolver.resolve(op.source)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		if !ok {
 			continue
 		}
 		targetID, ok, err := resolver.resolve(op.target)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		if !ok {
 			continue
 		}
-		if err := tx.DeleteEdge(sourceID, targetID, op.typ); err != nil && !isNotFound(err) {
-			return err
+		if err := tx.DeleteEdge(sourceID, targetID, op.typ); err != nil {
+			if !isNotFound(err) {
+				return 0, err
+			}
+		} else {
+			edgeDelta--
 		}
 		if _, err := tx.CreateEdge(sourceID, targetID, op.typ, latticedb.CreateEdgeOptions{
 			Properties: edgePropertyMap(op.mut.props),
 		}); err != nil {
-			return err
+			return 0, err
 		}
+		edgeDelta++
 	}
 
-	return nil
+	return edgeDelta, nil
 }
 
 func isNotFound(err error) bool {
@@ -490,7 +763,7 @@ func saveToLatticeDB(latticePath string, nodes map[string]*NodeData, outEdges ma
 
 	db, err := latticedb.Open(tmpPath, latticedb.OpenOptions{
 		Create:               true,
-		CacheSizeMB:          128,
+		CacheSizeMB:          64,
 		EnableAdjacencyCache: true,
 	})
 	if err != nil {
@@ -498,18 +771,22 @@ func saveToLatticeDB(latticePath string, nodes map[string]*NodeData, outEdges ma
 	}
 
 	nodeIDMap := make(map[string]latticedb.NodeID, len(nodes))
+	var totalEdges uint64
 
 	err = db.Update(func(tx *latticedb.Tx) error {
-		// 1. Create all nodes and set properties in batch
+		// 1. Create all nodes with packed v2 properties and primary label.
 		for _, node := range nodes {
-			labels := node.Labels
-			if len(labels) == 0 {
-				labels = []string{"Node"}
+			primary := identityLabel(node.Labels)
+			createLabels := node.Labels
+			if primary != "" {
+				createLabels = []string{primary}
+			} else if len(createLabels) == 0 {
+				createLabels = []string{"Node"}
 			}
 
 			n, err := tx.CreateNode(latticedb.CreateNodeOptions{
-				Labels:     labels,
-				Properties: nodePropertyMap(node.ID, node.Properties),
+				Labels:     createLabels,
+				Properties: nodePropertyMap(node.ID, node.Labels, node.Properties),
 			})
 			if err != nil {
 				return fmt.Errorf("failed to create node %s: %w", node.ID, err)
@@ -517,7 +794,7 @@ func saveToLatticeDB(latticePath string, nodes map[string]*NodeData, outEdges ma
 			nodeIDMap[node.ID] = n.ID
 		}
 
-		// 2. Create all edges
+		// 2. Create all edges with packed properties.
 		for srcID, edges := range outEdges {
 			srcNodeID, ok1 := nodeIDMap[srcID]
 			if !ok1 {
@@ -534,27 +811,34 @@ func saveToLatticeDB(latticePath string, nodes map[string]*NodeData, outEdges ma
 					edgeType = "RELATES"
 				}
 
-				_, _ = tx.CreateEdge(srcNodeID, tgtNodeID, edgeType, latticedb.CreateEdgeOptions{
+				if _, err := tx.CreateEdge(srcNodeID, tgtNodeID, edgeType, latticedb.CreateEdgeOptions{
 					Properties: edgePropertyMap(edge.Properties),
-				})
+				}); err == nil {
+					totalEdges++
+				}
 			}
 		}
 
+		if err := tx.SetStreamOffset(latticeMetaStream, latticeMetaSchemaKey, latticeSchemaVersion); err != nil {
+			return err
+		}
+		if err := tx.SetStreamOffset(latticeMetaStream, latticeMetaEdgesKey, totalEdges); err != nil {
+			return err
+		}
 		return nil
 	})
 
 	if err == nil {
-		// Create B-Tree property indexes on the newly populated database for fast O(1) lookups.
-		// Every node is indexed by its stable string id under its own label: a
-		// single "Node" label index would never match, because nodes only carry
-		// their level labels.
+		// Create B-Tree property and FTS indexes on the populated database.
 		for _, label := range identityIndexLabels {
 			_ = db.CreateNodePropertyIndex(label, "id")
+			_ = db.CreateNodeFTSIndex(label, "search_text")
 		}
 		_ = db.CreateNodePropertyIndex("L0Domain", "name")
 		_ = db.CreateNodePropertyIndex("L1Module", "path")
 		_ = db.CreateNodePropertyIndex("L2Class", "name")
 		_ = db.CreateNodePropertyIndex("L3Symbol", "name")
+		_ = db.CreateNodePropertyIndex("L3Symbol", "short_name")
 	}
 
 	_ = db.Close()
@@ -565,6 +849,8 @@ func saveToLatticeDB(latticePath string, nodes map[string]*NodeData, outEdges ma
 		_ = os.Remove(tmpPath + "-shm")
 		return err
 	}
+
+	closeCachedReadOnlyDB()
 
 	// Rename main file
 	if err := os.Rename(tmpPath, latticePath); err != nil {
@@ -590,11 +876,12 @@ func loadFromLatticeDB(latticePath string) (map[string]*NodeData, map[string][]m
 	if _, err := os.Stat(latticePath); err != nil {
 		return nil, nil, nil, err
 	}
+	closeCachedReadOnlyDB()
 
 	db, err := openLatticeWithRetry(latticePath, latticedb.OpenOptions{
 		Create:               false,
 		ReadOnly:             true,
-		CacheSizeMB:          128,
+		CacheSizeMB:          32,
 		EnableAdjacencyCache: true,
 	})
 	if err != nil {
@@ -602,6 +889,64 @@ func loadFromLatticeDB(latticePath string) (map[string]*NodeData, map[string][]m
 	}
 	defer db.Close()
 
+	ver, ok, err := db.GetStreamOffset(latticeMetaStream, latticeMetaSchemaKey)
+	if err == nil && ok && ver == latticeSchemaVersion {
+		return loadNativeV2(db)
+	}
+	return loadLegacyCypher(db)
+}
+
+func loadNativeV2(db *latticedb.DB) (map[string]*NodeData, map[string][]models.GraphEdge, map[string][]models.GraphEdge, error) {
+	nodes := make(map[string]*NodeData)
+	outEdges := make(map[string][]models.GraphEdge)
+	inEdges := make(map[string][]models.GraphEdge)
+	nidToStr := make(map[latticedb.NodeID]string)
+
+	err := db.View(func(tx *latticedb.Tx) error {
+		for _, lbl := range identityIndexLabels {
+			nids, err := db.GetNodesByLabel(lbl)
+			if err != nil {
+				return err
+			}
+			for _, nid := range nids {
+				node, ok := readNodeDataFromTx(tx, nid, lbl)
+				if !ok {
+					continue
+				}
+				nodes[node.ID] = node
+				nidToStr[nid] = node.ID
+			}
+		}
+
+		for nid, srcID := range nidToStr {
+			rawEdges, err := tx.GetOutgoingEdges(nid)
+			if err != nil {
+				return err
+			}
+			for _, e := range rawEdges {
+				tgtID, ok := nidToStr[e.TargetID]
+				if !ok || tgtID == "" {
+					continue
+				}
+				edge := models.GraphEdge{
+					SourceID:   srcID,
+					TargetID:   tgtID,
+					EdgeType:   e.Type,
+					Properties: readEdgePropsFromTx(tx, e.ID),
+				}
+				outEdges[srcID] = append(outEdges[srcID], edge)
+				inEdges[tgtID] = append(inEdges[tgtID], edge)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("LatticeDB native v2 load failed: %w", err)
+	}
+	return nodes, outEdges, inEdges, nil
+}
+
+func loadLegacyCypher(db *latticedb.DB) (map[string]*NodeData, map[string][]models.GraphEdge, map[string][]models.GraphEdge, error) {
 	// 1. Query nodes
 	nodeRes, err := db.Query("MATCH (n) RETURN n.id AS id, labels(n) AS labels, properties(n) AS props", nil)
 	if err != nil {
@@ -629,6 +974,18 @@ func loadFromLatticeDB(latticePath string) (map[string]*NodeData, map[string][]m
 		props, ok := row["props"].(map[string]any)
 		if !ok || props == nil {
 			props = make(map[string]any)
+		} else if rawP, hasP := props["_p"]; hasP {
+			if unpacked, okP := unpackPropsValue(rawP); okP {
+				props = unpacked
+				if unpackedLabels := extractLabels(props["labels"], ""); len(unpackedLabels) > 0 {
+					labels = unpackedLabels
+				}
+			} else {
+				delete(props, "_p")
+				delete(props, "search_text")
+				delete(props, "short_name")
+				normalizeNodeProperties(props)
+			}
 		} else {
 			normalizeNodeProperties(props)
 		}
@@ -660,6 +1017,13 @@ func loadFromLatticeDB(latticePath string) (map[string]*NodeData, map[string][]m
 		props, ok := row["props"].(map[string]any)
 		if !ok || props == nil {
 			props = make(map[string]any)
+		} else if rawP, hasP := props["_p"]; hasP {
+			if unpacked, okP := unpackPropsValue(rawP); okP {
+				props = unpacked
+			} else {
+				delete(props, "_p")
+				normalizeNodeProperties(props)
+			}
 		} else {
 			normalizeNodeProperties(props)
 		}
@@ -676,4 +1040,629 @@ func loadFromLatticeDB(latticePath string) (map[string]*NodeData, map[string][]m
 	}
 
 	return nodes, outEdges, inEdges, nil
+}
+
+// -----------------------------------------------------------------------------
+// Lazy On-Demand Native Operations
+// -----------------------------------------------------------------------------
+
+var (
+	roCacheMu    sync.Mutex
+	roCachePath  string
+	roCacheMtime int64
+	roCacheSize  int64
+	roCacheDB    *latticedb.DB
+	roCacheTimer *time.Timer
+)
+
+const roCacheIdleTTL = 8 * time.Millisecond
+
+func closeCachedReadOnlyDB() {
+	roCacheMu.Lock()
+	defer roCacheMu.Unlock()
+	closeCachedReadOnlyDBLocked()
+}
+
+func closeCachedReadOnlyDBLocked() {
+	if roCacheTimer != nil {
+		roCacheTimer.Stop()
+		roCacheTimer = nil
+	}
+	if roCacheDB != nil {
+		_ = roCacheDB.Close()
+		roCacheDB = nil
+	}
+	roCachePath = ""
+	roCacheMtime = 0
+	roCacheSize = 0
+}
+
+func withReadOnlyDB(latticePath string, cacheMB uint32, fn func(db *latticedb.DB) error) error {
+	if cacheMB < 8 {
+		cacheMB = 8
+	}
+	stat, err := os.Stat(latticePath)
+	if err != nil {
+		return err
+	}
+
+	roCacheMu.Lock()
+	defer roCacheMu.Unlock()
+
+	if roCacheTimer != nil {
+		roCacheTimer.Stop()
+		roCacheTimer = nil
+	}
+
+	mtime := stat.ModTime().UnixNano()
+	size := stat.Size()
+	if roCacheDB != nil && (roCachePath != latticePath || roCacheMtime != mtime || roCacheSize != size) {
+		closeCachedReadOnlyDBLocked()
+	}
+
+	if roCacheDB == nil {
+		db, openErr := openLatticeWithRetry(latticePath, latticedb.OpenOptions{
+			Create:               false,
+			ReadOnly:             true,
+			CacheSizeMB:          cacheMB,
+			EnableAdjacencyCache: true,
+		})
+		if openErr != nil {
+			return openErr
+		}
+		roCacheDB = db
+		roCachePath = latticePath
+		roCacheMtime = mtime
+		roCacheSize = size
+	}
+
+	runErr := fn(roCacheDB)
+
+	roCacheTimer = time.AfterFunc(roCacheIdleTTL, func() {
+		closeCachedReadOnlyDB()
+	})
+	return runErr
+}
+
+func hasNodeInLatticeDB(latticePath string, id string) bool {
+	var found bool
+	_ = withReadOnlyDB(latticePath, 8, func(db *latticedb.DB) error {
+		return db.View(func(tx *latticedb.Tx) error {
+			_, _, found = resolveNodeIDInTx(tx, id)
+			return nil
+		})
+	})
+	return found
+}
+
+func getNodeFromLatticeDB(latticePath string, id string) (*NodeData, bool) {
+	var node *NodeData
+	var found bool
+	_ = withReadOnlyDB(latticePath, 8, func(db *latticedb.DB) error {
+		return db.View(func(tx *latticedb.Tx) error {
+			nid, lbl, ok := resolveNodeIDInTx(tx, id)
+			if !ok {
+				return nil
+			}
+			node, found = readNodeDataFromTx(tx, nid, lbl)
+			return nil
+		})
+	})
+	return node, found
+}
+
+func findNodesByLabelPropertyInLatticeDB(latticePath string, label string, key string, value any, limit int) ([]*NodeData, bool) {
+	queryLimit := uint(limit)
+	if queryLimit == 0 {
+		queryLimit = 1024
+	}
+
+	var results []*NodeData
+	supported := true
+	err := withReadOnlyDB(latticePath, 8, func(db *latticedb.DB) error {
+		return db.View(func(tx *latticedb.Tx) error {
+			ids, err := tx.FindNodesByLabelProperty(label, key, toLatticeValue(value), queryLimit)
+			if err != nil {
+				if errors.Is(err, &latticedb.Error{Code: latticedb.ErrorUnsupported}) {
+					supported = false
+				}
+				return nil
+			}
+			for _, nid := range ids {
+				if node, ok := readNodeDataFromTx(tx, nid, label); ok {
+					results = append(results, node)
+					if limit > 0 && len(results) >= limit {
+						break
+					}
+				}
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, false
+	}
+	return results, supported
+}
+
+func findSymbolsByNameInLatticeDB(latticePath string, name string, filePath string) []*NodeData {
+	if name == "" {
+		return nil
+	}
+	short := shortSymbolName(name)
+	var results []*NodeData
+	seen := make(map[latticedb.NodeID]bool)
+
+	_ = withReadOnlyDB(latticePath, 8, func(db *latticedb.DB) error {
+		return db.View(func(tx *latticedb.Tx) error {
+			type lookupSpec struct {
+				label string
+				key   string
+				val   string
+			}
+			specs := []lookupSpec{
+				{label: "L3Symbol", key: "name", val: name},
+				{label: "L3Symbol", key: "short_name", val: short},
+				{label: "L2Class", key: "name", val: name},
+			}
+			for _, sp := range specs {
+				ids, err := tx.FindNodesByLabelProperty(sp.label, sp.key, sp.val, 256)
+				if err != nil {
+					continue
+				}
+				for _, nid := range ids {
+					if seen[nid] {
+						continue
+					}
+					seen[nid] = true
+					node, ok := readNodeDataFromTx(tx, nid, sp.label)
+					if !ok {
+						continue
+					}
+					nName, _ := node.Properties["name"].(string)
+					if nName != name && !strings.HasSuffix(nName, "."+name) {
+						continue
+					}
+					if filePath != "" {
+						fPath, _ := node.Properties["file_path"].(string)
+						if fPath != filePath {
+							continue
+						}
+					}
+					results = append(results, node)
+				}
+			}
+			return nil
+		})
+	})
+	return results
+}
+
+func queryNodesFromLatticeDB(latticePath string, level string, domain string, limit int) []*NodeData {
+	var targetLabels []string
+	if lbl := labelForLevel(level); lbl != "" {
+		targetLabels = []string{lbl}
+	} else {
+		targetLabels = identityIndexLabels
+	}
+
+	var results []*NodeData
+	_ = withReadOnlyDB(latticePath, 8, func(db *latticedb.DB) error {
+		return db.View(func(tx *latticedb.Tx) error {
+			for _, lbl := range targetLabels {
+				nids, err := db.GetNodesByLabel(lbl)
+				if err != nil {
+					continue
+				}
+				for _, nid := range nids {
+					node, ok := readNodeDataFromTx(tx, nid, lbl)
+					if !ok {
+						continue
+					}
+					if level != "" {
+						if lvl, _ := node.Properties["level"].(string); lvl != level {
+							continue
+						}
+					}
+					if domain != "" {
+						if dom, _ := node.Properties["domain"].(string); dom != domain {
+							continue
+						}
+					}
+					results = append(results, node)
+					if limit > 0 && len(results) >= limit {
+						return nil
+					}
+				}
+			}
+			return nil
+		})
+	})
+	return results
+}
+
+func getOutgoingEdgesFromLatticeDB(latticePath string, nodeID string, edgeType string) ([]models.GraphEdge, []*NodeData) {
+	var edges []models.GraphEdge
+	var neighbors []*NodeData
+
+	_ = withReadOnlyDB(latticePath, 8, func(db *latticedb.DB) error {
+		return db.View(func(tx *latticedb.Tx) error {
+			nid, _, ok := resolveNodeIDInTx(tx, nodeID)
+			if !ok {
+				return nil
+			}
+			var rawEdges []latticedb.Edge
+			var err error
+			if edgeType != "" {
+				rawEdges, err = tx.GetOutgoingEdgesByType(nid, edgeType, 1000000)
+			} else {
+				rawEdges, err = tx.GetOutgoingEdges(nid)
+			}
+			if err != nil {
+				return nil
+			}
+			for i, e := range rawEdges {
+				var tgtID string
+				if i < 64 {
+					if tgtNode, ok := readNodeDataFromTx(tx, e.TargetID, ""); ok {
+						tgtID = tgtNode.ID
+						neighbors = append(neighbors, tgtNode)
+					}
+				}
+				if tgtID == "" {
+					if val, ok, err := tx.GetProperty(e.TargetID, "id"); err == nil && ok {
+						tgtID, _ = val.(string)
+					}
+				}
+				if tgtID == "" {
+					continue
+				}
+				edges = append(edges, models.GraphEdge{
+					SourceID:   nodeID,
+					TargetID:   tgtID,
+					EdgeType:   e.Type,
+					Properties: readEdgePropsFromTx(tx, e.ID),
+				})
+			}
+			return nil
+		})
+	})
+	return edges, neighbors
+}
+
+func getIncomingEdgesFromLatticeDB(latticePath string, nodeID string, edgeType string) ([]models.GraphEdge, []*NodeData) {
+	var edges []models.GraphEdge
+	var neighbors []*NodeData
+
+	_ = withReadOnlyDB(latticePath, 8, func(db *latticedb.DB) error {
+		return db.View(func(tx *latticedb.Tx) error {
+			nid, _, ok := resolveNodeIDInTx(tx, nodeID)
+			if !ok {
+				return nil
+			}
+			var rawEdges []latticedb.Edge
+			var err error
+			if edgeType != "" {
+				rawEdges, err = tx.GetIncomingEdgesByType(nid, edgeType, 1000000)
+			} else {
+				rawEdges, err = tx.GetIncomingEdges(nid)
+			}
+			if err != nil {
+				return nil
+			}
+			for i, e := range rawEdges {
+				var srcID string
+				if i < 64 {
+					if srcNode, ok := readNodeDataFromTx(tx, e.SourceID, ""); ok {
+						srcID = srcNode.ID
+						neighbors = append(neighbors, srcNode)
+					}
+				}
+				if srcID == "" {
+					if val, ok, err := tx.GetProperty(e.SourceID, "id"); err == nil && ok {
+						srcID, _ = val.(string)
+					}
+				}
+				if srcID == "" {
+					continue
+				}
+				edges = append(edges, models.GraphEdge{
+					SourceID:   srcID,
+					TargetID:   nodeID,
+					EdgeType:   e.Type,
+					Properties: readEdgePropsFromTx(tx, e.ID),
+				})
+			}
+			return nil
+		})
+	})
+	return edges, neighbors
+}
+
+func getEdgesByTypeFromLatticeDB(latticePath string, edgeType string) []models.GraphEdge {
+	targetLabels := identityIndexLabels
+	if edgeType == string(models.EdgeImports) {
+		targetLabels = []string{"L1Module"}
+	}
+
+	var result []models.GraphEdge
+	_ = withReadOnlyDB(latticePath, 8, func(db *latticedb.DB) error {
+		return db.View(func(tx *latticedb.Tx) error {
+			nidToStr := make(map[latticedb.NodeID]string)
+			resolveStr := func(nid latticedb.NodeID) string {
+				if s, ok := nidToStr[nid]; ok {
+					return s
+				}
+				if val, ok, err := tx.GetProperty(nid, "id"); err == nil && ok {
+					if s, _ := val.(string); s != "" {
+						nidToStr[nid] = s
+						return s
+					}
+				}
+				return ""
+			}
+
+			for _, lbl := range targetLabels {
+				nids, err := db.GetNodesByLabel(lbl)
+				if err != nil {
+					continue
+				}
+				for _, nid := range nids {
+					var rawEdges []latticedb.Edge
+					if edgeType != "" {
+						rawEdges, err = tx.GetOutgoingEdgesByType(nid, edgeType, 1000000)
+					} else {
+						rawEdges, err = tx.GetOutgoingEdges(nid)
+					}
+					if err != nil || len(rawEdges) == 0 {
+						continue
+					}
+					srcID := resolveStr(nid)
+					if srcID == "" {
+						continue
+					}
+					for _, e := range rawEdges {
+						tgtID := resolveStr(e.TargetID)
+						if tgtID == "" {
+							continue
+						}
+						result = append(result, models.GraphEdge{
+							SourceID:   srcID,
+							TargetID:   tgtID,
+							EdgeType:   e.Type,
+							Properties: readEdgePropsFromTx(tx, e.ID),
+						})
+					}
+				}
+			}
+			return nil
+		})
+	})
+	return result
+}
+
+func getEdgePropsFromLatticeDB(latticePath string, sourceID, targetID, edgeType string) (map[string]any, bool) {
+	var props map[string]any
+	var found bool
+	_ = withReadOnlyDB(latticePath, 8, func(db *latticedb.DB) error {
+		return db.View(func(tx *latticedb.Tx) error {
+			srcNID, _, ok1 := resolveNodeIDInTx(tx, sourceID)
+			if !ok1 {
+				return nil
+			}
+			tgtNID, _, ok2 := resolveNodeIDInTx(tx, targetID)
+			if !ok2 {
+				return nil
+			}
+			edges, err := tx.GetOutgoingEdgesByType(srcNID, edgeType, 1000000)
+			if err != nil {
+				return nil
+			}
+			for _, e := range edges {
+				if e.TargetID == tgtNID {
+					props = readEdgePropsFromTx(tx, e.ID)
+					found = true
+					return nil
+				}
+			}
+			return nil
+		})
+	})
+	return props, found
+}
+
+func inspectNodesInLatticeDB(latticePath string, ids []string) map[string]nodeEdgesSnapshot {
+	if len(ids) == 0 {
+		return nil
+	}
+	out := make(map[string]nodeEdgesSnapshot, len(ids))
+	err := withReadOnlyDB(latticePath, 8, func(db *latticedb.DB) error {
+		return db.View(func(tx *latticedb.Tx) error {
+			nidToStr := make(map[latticedb.NodeID]string)
+			resolveStr := func(nid latticedb.NodeID) string {
+				if s, ok := nidToStr[nid]; ok {
+					return s
+				}
+				if val, ok, err := tx.GetProperty(nid, "id"); err == nil && ok {
+					if s, _ := val.(string); s != "" {
+						nidToStr[nid] = s
+						return s
+					}
+				}
+				return ""
+			}
+
+			for _, id := range ids {
+				nid, lbl, ok := resolveNodeIDInTx(tx, id)
+				if !ok {
+					continue
+				}
+				nidToStr[nid] = id
+				snap := nodeEdgesSnapshot{labels: []string{lbl}}
+				if rawOut, err := tx.GetOutgoingEdges(nid); err == nil {
+					for _, e := range rawOut {
+						if tgtID := resolveStr(e.TargetID); tgtID != "" {
+							snap.outEdges = append(snap.outEdges, models.GraphEdge{
+								SourceID: id,
+								TargetID: tgtID,
+								EdgeType: e.Type,
+							})
+						}
+					}
+				}
+				if rawIn, err := tx.GetIncomingEdges(nid); err == nil {
+					for _, e := range rawIn {
+						if srcID := resolveStr(e.SourceID); srcID != "" {
+							snap.inEdges = append(snap.inEdges, models.GraphEdge{
+								SourceID: srcID,
+								TargetID: id,
+								EdgeType: e.Type,
+							})
+						}
+					}
+				}
+				out[id] = snap
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		return nil
+	}
+	return out
+}
+
+func countNodesAndEdgesInLatticeDB(latticePath string) (map[string]int, bool) {
+	var counts map[string]int
+	var okCounts bool
+	_ = withReadOnlyDB(latticePath, 8, func(db *latticedb.DB) error {
+		ver, ok, err := db.GetStreamOffset(latticeMetaStream, latticeMetaSchemaKey)
+		if err != nil || !ok || ver != latticeSchemaVersion {
+			return nil
+		}
+		totalEdges, ok, err := db.GetStreamOffset(latticeMetaStream, latticeMetaEdgesKey)
+		if err != nil || !ok {
+			return nil
+		}
+
+		n0, err0 := db.GetNodesByLabel("L0Domain")
+		n1, err1 := db.GetNodesByLabel("L1Module")
+		n2, err2 := db.GetNodesByLabel("L2Class")
+		n3, err3 := db.GetNodesByLabel("L3Symbol")
+		if err0 != nil || err1 != nil || err2 != nil || err3 != nil {
+			return nil
+		}
+
+		l0, l1, l2, l3 := len(n0), len(n1), len(n2), len(n3)
+		counts = map[string]int{
+			"total_nodes": l0 + l1 + l2 + l3,
+			"total_edges": int(totalEdges),
+			"l0_domains":  l0,
+			"l1_modules":  l1,
+			"l2_classes":  l2,
+			"l3_symbols":  l3,
+		}
+		okCounts = true
+		return nil
+	})
+	return counts, okCounts
+}
+
+func ftsSearchInLatticeDB(latticePath string, queryText string, limit int) ([]map[string]any, bool) {
+	queryTokens := tokenize(queryText)
+	if len(queryTokens) == 0 {
+		return nil, true
+	}
+
+	perLimit := uint32(limit * 4)
+	if perLimit < 50 {
+		perLimit = 50
+	}
+
+	var results []map[string]any
+	var okFTS bool
+	err := withReadOnlyDB(latticePath, 8, func(db *latticedb.DB) error {
+		scores := make(map[latticedb.NodeID]float64)
+		nodeLabels := make(map[latticedb.NodeID]string)
+
+		for _, tok := range queryTokens {
+			matchedTok := false
+			for _, lbl := range identityIndexLabels {
+				res, err := db.FTSSearch(lbl, "search_text", tok, latticedb.FTSSearchOptions{Limit: perLimit})
+				if err != nil {
+					if errors.Is(err, &latticedb.Error{Code: latticedb.ErrorUnsupported}) {
+						okFTS = false
+						return nil
+					}
+					continue
+				}
+				for _, r := range res {
+					scores[r.NodeID] += float64(r.Score)
+					nodeLabels[r.NodeID] = lbl
+					matchedTok = true
+				}
+			}
+			if !matchedTok && len(tok) >= 3 {
+				for _, lbl := range identityIndexLabels {
+					res, err := db.FTSSearch(lbl, "search_text", tok, latticedb.FTSSearchOptions{
+						Limit:         perLimit,
+						MaxDistance:   1,
+						MinTermLength: 2,
+					})
+					if err != nil {
+						continue
+					}
+					for _, r := range res {
+						scores[r.NodeID] += float64(r.Score) * 0.7
+						nodeLabels[r.NodeID] = lbl
+					}
+				}
+			}
+		}
+
+		if len(scores) == 0 {
+			// Fall back to in-memory BM25 in case a prefix match applies.
+			okFTS = false
+			return nil
+		}
+
+		type scoredNode struct {
+			nid   latticedb.NodeID
+			score float64
+		}
+		ranked := make([]scoredNode, 0, len(scores))
+		for nid, sc := range scores {
+			if sc > 0 {
+				ranked = append(ranked, scoredNode{nid: nid, score: sc})
+			}
+		}
+		sort.Slice(ranked, func(i, j int) bool {
+			return ranked[i].score > ranked[j].score
+		})
+		if limit > 0 && len(ranked) > limit {
+			ranked = ranked[:limit]
+		}
+
+		_ = db.View(func(tx *latticedb.Tx) error {
+			for _, item := range ranked {
+				node, ok := readNodeDataFromTx(tx, item.nid, nodeLabels[item.nid])
+				if !ok {
+					continue
+				}
+				res := make(map[string]any, len(node.Properties)+1)
+				for k, v := range node.Properties {
+					res[k] = v
+				}
+				res["_rank"] = item.score
+				results = append(results, res)
+			}
+			return nil
+		})
+		okFTS = true
+		return nil
+	})
+	if err != nil {
+		return nil, false
+	}
+	return results, okFTS
 }

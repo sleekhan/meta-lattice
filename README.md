@@ -15,7 +15,6 @@
   <a href="https://github.com/jeffhajewski/latticedb"><img src="https://img.shields.io/badge/LatticeDB-v0.15.0-6366F1?style=flat-square" alt="LatticeDB" /></a>
   <a href="#-building--cross-compilation"><img src="https://img.shields.io/badge/Platform-macOS%20%7C%20Linux%20%7C%20Windows-green.svg?style=flat-square" alt="Platform Support" /></a>
   <a href="https://modelcontextprotocol.io"><img src="https://img.shields.io/badge/MCP-2024--11--05-orange.svg?style=flat-square" alt="MCP Protocol" /></a>
-  <a href="#-testing"><img src="https://img.shields.io/badge/Tests-25%20Passing-brightgreen.svg?style=flat-square" alt="Tests" /></a>
 </p>
 
 <p align="center">
@@ -34,7 +33,7 @@ It ships official [LatticeDB](https://github.com/jeffhajewski/latticedb) v0.15.0
 
 ## 🏛 Key Advantages
 
-- **Official LatticeDB single-file graph database**: manages the L0–L3 knowledge graph and edge relations in a single binary file `.lattice/knowledge.lattice` via the official `github.com/jeffhajewski/latticedb/bindings/go`, with auto-generated B-Tree property indexes for fast lookups.
+- **Official LatticeDB single-file graph database (v2 packed + lazy on-demand engine)**: manages the L0–L3 knowledge graph and edge relations in a single binary file `.lattice/knowledge.lattice` via the official `github.com/jeffhajewski/latticedb/bindings/go`. Uses a packed v2 property schema (`_p` JSON payload + B-Tree indexes on `(label, id)`, `(L1Module, path)`, `(L2Class, name)`, `(L3Symbol, name/short_name)` + native BM25 FTS on `search_text`) so cold queries (`zoom_*`, `blast`, `audit`, `status`, hook edits) execute directly against LatticeDB in 27–147 ms on 3,000-file graphs without hydrating the full graph into memory.
 - **Native libraries auto-bundled in release artifacts**: release archives ship the `liblattice` shared library with preconfigured RPATH (`@executable_path`, `$ORIGIN`), so no system library installation is needed.
 - **Multi-core parallel parsing optimized for large projects**: a `runtime.GOMAXPROCS(0)`-based worker pool parses thousands to tens of thousands of files at full CPU speed.
 - **Built-in enterprise multi-language AST parsers**: natively parses **Go** (`go/ast`, `go/parser`), **Python**, **TypeScript/JavaScript**, **Java**, **Kotlin** (`.kt`, `.kts`), **C#** (`.cs`), **Swift** (`.swift`), **PHP** (`.php`), **Rust** (`.rs`), and **C/C++** (`.c`, `.cpp`, `.cc`, `.cxx`, `.h`, `.hpp`) to extract symbols, signatures, classes, and call graphs. Frontend support: **Vue SFC** (`.vue`), **Svelte** (`.svelte`), **React JSX/TSX** (JSX usage edges, PascalCase component detection), **Angular** (`@Component` decorator recognition).
@@ -67,7 +66,7 @@ It ships official [LatticeDB](https://github.com/jeffhajewski/latticedb) v0.15.0
 ### 4. Incremental AST Indexer & Local Cache Engine
 * **SHA-256 & mtime mapping**: file hashes and mtimes are recorded in cache state (`.lattice/cache_state.json`, v1.4). A version mismatch triggers automatic full re-indexing on the next sync.
 * **Localized delta edge updates**: on file modification only the directly related dependency edges are selectively deleted and rebuilt in $O(\Delta)$ — no full-graph wipe — achieving millisecond re-syncs on tens of thousands of files.
-* **Incremental persistence**: only the nodes and edges touched since the last save are replayed into `knowledge.lattice` in a single transaction (~23–62 ms on 6k–18k node graphs). Initial or forced syncs still rebuild the file, and a lock conflict or an unindexed legacy file falls back safely instead of corrupting the graph.
+* **Incremental persistence & lazy native queries**: only the nodes and edges touched since the last save are replayed into `knowledge.lattice` in a single transaction, and read/hook operations query LatticeDB's B-Tree, adjacency, and FTS indexes on demand without eager full-graph loading (~27 ms cold `zoom_symbol`/`zoom_module`/`blast`, ~147 ms single-file hook sync on 3,000 files). Initial or forced syncs still rebuild the file, and a lock conflict or an unindexed legacy file falls back safely instead of corrupting the graph.
 * **Automatic cross-file dependency restoration**: `IMPORTS` edges between files and optimally-scoped (same class first, same file first, imported files first) `CALLS` edges between L3 symbols.
   * **Go**: resolves package imports against `go.mod` module paths, linking `IMPORTS` edges to workspace-internal `.go` files (excluding tests). Multi-`go.mod` monorepos supported.
   * **TypeScript / JavaScript**: resolves relative/absolute imports and `tsconfig.json` path aliases (`@/*`, `~/*`) to file paths.

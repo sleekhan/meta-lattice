@@ -74,7 +74,31 @@ Meta-Lattice는 **파일 SHA-256 해시와 수정 시각(mtime)을 결합한 2�
 - 변경이 없을 때도 약 46ms가 걸립니다. 파일 스캔과 `stat` 외에 약 8.4MB의 그래프 DB를 읽어 들이는 비용이 포함된 것으로 보이지만(프로파일링은 하지 않은 추정), 구성 요소별로 분해해 측정하지는 않았습니다.
 - 파일이 하나라도 바뀌면 전체 `IMPORTS`/`CALLS` 엣지를 다시 해석합니다(코드 기준). 그래서 수정 비용은 변경 파일 수보다 저장소 전체 크기의 영향을 더 받습니다.
 - `audit`과 `blast`는 같은 데이터에서 각각 약 0.15초, 0.11초가 걸렸습니다(프로세스 시작과 DB 로드 포함).
-- 브랜치 전환처럼 수십 개 파일이 바뀌는 시나리오와 더 큰 코드베이스는 측정하지 않았습니다.
+
+#### 증분 영속화 및 온디맨드 지연 조회 엔진 (v2 스키마)
+
+`GraphStorage`는 **v2 압축 프로퍼티 스키마(`_p` JSON 페이로드 + 인덱싱 전용 스칼라 키)**, **온디맨드 네이티브 LatticeDB 직접 조회(`lazyNative` 모드)**, 그리고 **변이 저널(Mutation Journal)**을 결합하여 대규모 저장소에서의 전체 그래프 로드 및 전체 파일 재작성 병목을 제거합니다([`backend_latticedb.go`](../src/storage/backend_latticedb.go), [`engine.go`](../src/storage/engine.go)):
+
+1. **v2 압축 프로퍼티 레이아웃**: 각 노드의 전체 속성 맵은 `"_p"`(압축 JSON 바이트)에 저장하고, B-Tree 및 FTS 인덱스가 사용하는 핵심 스칼라 키(`"id"`, `"name"`, `"path"`, `"short_name"`, `"search_text"`)만 최상위 프로퍼티로 기록합니다. 이를 통해 노드당 B-Tree 쓰기 증폭을 약 6배 줄여 3,000개 파일 최초 전체 인덱싱 시간을 141초에서 약 20.1초로 단축했습니다.
+2. **온디맨드 지연 네이티브 실행 (`lazyNative`)**: `NewGraphStorage` 초기화 시 전체 노드/엣지를 메모리에 적재하지 않고 `.lattice` v2 메타데이터(`__meta` 스트림 오프셋)만 약 26.7ms에 검증합니다. 이후 단건 조회, 심볼/모듈 탐색, BM25 FTS 검색, 역방향 영향도 추적, 아키텍처 감사, 단일 파일 훅 동기화는 읽기 전용 핸들 리스 캐시와 이웃 노드 프리페치를 활용해 LatticeDB 네이티브 C API(`FindNodesByLabelProperty`, `GetNodesByLabel`, `FTSSearch`, `GetOutgoingEdgesByType`, `GetIncomingEdgesByType`, `GetStreamOffset`)를 직접 호출합니다.
+3. **증분 변이 저널**: 마지막 저장 이후 변경된 노드/엣지의 최종 의도만 단일 트랜잭션으로 `.lattice` 파일에 재생하며 `__meta`의 `total_edges` 카운트를 정확하게 갱신합니다.
+
+> 📏 **측정 환경**: Linux/arm64 빌더 컨테이너, 합성 3,000개 파일 Go 워크스페이스(20개 패키지 × 150개 파일, 노드 15,020개, 엣지 24,000개). 각 Cold 측정은 영속화된 `.lattice` 파일에 대해 새 `GraphStorage` 인스턴스를 열어 측정했습니다.
+
+| 시나리오 (3,000개 파일 / 노드 15,020개 / 엣지 24,000개) | 기존 (v1 Eager Cypher + 전체 재작성) | 현재 (v2 압축 + Lazy Native + 저널) | 속도 향상 |
+| :--- | :--- | :--- | :--- |
+| **최초 전체 동기화 (`Sync(true)`)** | 약 141.0 s | **약 20.06 s** | **7.0×** |
+| **Cold `NewGraphStorage` 기동** | 약 3,650 ms (전체 Cypher 로드) | **약 26.7 ms** (메타데이터 프로브) | **136×** |
+| **Cold `zoom_symbol`** | 약 3,650 ms | **약 26.9 ms** | **135×** |
+| **Cold `zoom_module`** | 약 3,650 ms | **약 27.3 ms** | **133×** |
+| **Cold `estimate_blast_radius`** | 약 3,650 ms | **약 28.2 ms** | **129×** |
+| **Cold `zoom_search` (네이티브 BM25 FTS)** | 약 3,650 ms | **약 55.5 ms** | **65×** |
+| **Cold `zoom_overview`** | 약 3,650 ms | **약 111.7 ms** | **32×** |
+| **Cold `check_layer_violation`** | 약 3,650 ms | **약 113.7 ms** | **32×** |
+| **Cold 변경 없는 `Sync(false)`** | 약 3,650 ms | **약 71.3 ms** | **51×** |
+| **Cold 단일 파일 `SyncTargetFile` (훅 편집)** | 약 17,970 ms (전체 재작성) / 약 3,650 ms (로드) | **약 147.4 ms** (`mode=incremental`, 15 ops) | **121×** |
+
+- `.lattice/cache_state.json`에 파일별 심볼 메타데이터(`CachedSymbol`)와 영속화된 노드/엣지 수를 함께 저장하여, 단일 파일 수정 시 전체 그래프를 스캔하지 않고 $O(\Delta)$로 `IMPORTS`/`CALLS` 델타 엣지를 갱신합니다.
 
 > ⚡ **동작 특성**: 그래프가 비어 있는 상태에서 조회 도구(`zoom_*`, `check_layer_violation`, `estimate_blast_radius`)를 처음 호출하면 자동으로 인덱싱합니다. 이후 코드 변경을 반영하려면 `sync_index`(또는 `meta-lattice sync`)를 호출하세요. CLI의 `zoom`/`audit`/`blast` 명령은 실행 시마다 증분 동기화를 수행합니다.
 

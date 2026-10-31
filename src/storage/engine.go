@@ -28,6 +28,12 @@ type NodeData struct {
 	Properties map[string]any `json:"properties"`
 }
 
+type nodeEdgesSnapshot struct {
+	labels   []string
+	outEdges []models.GraphEdge
+	inEdges  []models.GraphEdge
+}
+
 type GraphStorage struct {
 	mu          sync.RWMutex
 	filePath    string                        // json backup path
@@ -39,7 +45,20 @@ type GraphStorage struct {
 	// CreateEdge can decide whether an edge is new in O(1) instead of scanning
 	// the source's edge list (which is quadratic for hubs such as L0 domains).
 	edgeIndex map[string]struct{}
-	bm25      *BM25Index
+	// Secondary in-memory indexes for O(1) lookups when the graph is hydrated.
+	byLevel      map[string]map[string]struct{} // level ("L0".."L3") -> set of nodeIDs
+	bySymbolName map[string]map[string]struct{} // full or short symbol name -> set of nodeIDs
+	byModulePath map[string]string              // module path -> nodeID
+	edgesByType  map[string]map[string]struct{} // edgeType -> set of edgeKeys
+
+	// lazyNative is true when the persisted .lattice file uses the v2 indexed
+	// schema and has not been hydrated into memory. Point queries, B-Tree
+	// lookups, FTS searches, and edge traversals execute directly against
+	// LatticeDB, while lazyNodeCache memoizes nodes read during lazy queries.
+	lazyNative    bool
+	lazyNodeCache map[string]*NodeData
+
+	bm25 *BM25Index
 	// counts memoizes CountNodesAndEdges; any mutation invalidates it.
 	counts      map[string]int
 	countsValid bool
@@ -114,12 +133,10 @@ func NewGraphStorage(storagePath string) *GraphStorage {
 	gs := &GraphStorage{
 		filePath:    jsonPath,
 		latticePath: latticePath,
-		nodes:       make(map[string]*NodeData),
-		outEdges:    make(map[string][]models.GraphEdge),
-		inEdges:     make(map[string][]models.GraphEdge),
-		edgeIndex:   make(map[string]struct{}),
 		bm25:        NewBM25Index(),
 	}
+	gs.clearInMemoryMapsLocked()
+
 	if err := gs.Load(); err != nil && !os.IsNotExist(err) {
 		if errors.Is(err, errDatabaseLocked) {
 			// Another process is writing; the file is fine, so do not touch it.
@@ -145,6 +162,18 @@ func NewGraphStorage(storagePath string) *GraphStorage {
 	return gs
 }
 
+func (s *GraphStorage) clearInMemoryMapsLocked() {
+	s.nodes = make(map[string]*NodeData)
+	s.outEdges = make(map[string][]models.GraphEdge)
+	s.inEdges = make(map[string][]models.GraphEdge)
+	s.edgeIndex = make(map[string]struct{})
+	s.byLevel = make(map[string]map[string]struct{})
+	s.bySymbolName = make(map[string]map[string]struct{})
+	s.byModulePath = make(map[string]string)
+	s.edgesByType = make(map[string]map[string]struct{})
+	s.lazyNodeCache = make(map[string]*NodeData)
+}
+
 func (s *GraphStorage) Load() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -152,18 +181,45 @@ func (s *GraphStorage) Load() error {
 	// 1. Try loading from native LatticeDB file (.lattice) if it exists
 	if HasNativeLatticeDB {
 		if fi, statErr := os.Stat(s.latticePath); statErr == nil {
+			isV2, probeErr := probeLatticeDB(s.latticePath)
+			if probeErr != nil {
+				if errors.Is(probeErr, errDatabaseLocked) {
+					return probeErr
+				}
+				return fmt.Errorf("corrupt LatticeDB file: %w", probeErr)
+			}
+			if isV2 {
+				// Fast path: v2 schema supports lazy on-demand native queries.
+				s.clearInMemoryMapsLocked()
+				s.lazyNative = true
+				s.bm25.Clear()
+				s.bm25Loaded = false
+				s.dirty = false
+				s.journal = nil
+				s.lastSaveMode = ""
+				s.lastSaveOps = 0
+				s.countsValid = false
+				if mtime, ok := storageMtime(s.latticePath); ok {
+					s.loadedMtime = mtime
+				} else {
+					s.loadedMtime = fi.ModTime().UnixNano()
+				}
+				return nil
+			}
+
+			// Legacy v1 schema: hydrate into memory so it can be queried and migrated.
 			nodes, outEdges, inEdges, err := loadFromLatticeDB(s.latticePath)
 			if err != nil {
 				if errors.Is(err, errDatabaseLocked) {
-					// Another process is writing; the file is not corrupt.
 					return err
 				}
 				return fmt.Errorf("corrupt LatticeDB file: %w", err)
 			}
+			s.lazyNative = false
 			s.nodes = nodes
 			s.outEdges = outEdges
 			s.inEdges = inEdges
-			s.rebuildEdgeIndexLocked()
+			s.rebuildIndexesLocked()
 			s.bm25.Clear()
 			s.bm25Loaded = false
 			s.dirty = false
@@ -191,9 +247,8 @@ func (s *GraphStorage) Load() error {
 		return err
 	}
 
-	s.nodes = make(map[string]*NodeData)
-	s.outEdges = make(map[string][]models.GraphEdge)
-	s.inEdges = make(map[string][]models.GraphEdge)
+	s.lazyNative = false
+	s.clearInMemoryMapsLocked()
 	s.bm25.Clear()
 	s.bm25Loaded = false
 	s.dirty = false
@@ -205,14 +260,16 @@ func (s *GraphStorage) Load() error {
 	}
 
 	for _, n := range state.Nodes {
+		normalizeNodeProperties(n.Properties)
 		s.nodes[n.ID] = n
 	}
 
 	for _, e := range state.Edges {
+		normalizeNodeProperties(e.Properties)
 		s.outEdges[e.SourceID] = append(s.outEdges[e.SourceID], e)
 		s.inEdges[e.TargetID] = append(s.inEdges[e.TargetID], e)
 	}
-	s.rebuildEdgeIndexLocked()
+	s.rebuildIndexesLocked()
 	s.countsValid = false
 
 	if HasNativeLatticeDB {
@@ -222,6 +279,125 @@ func (s *GraphStorage) Load() error {
 	}
 
 	return nil
+}
+
+// ensureLoadedLocked hydrates the full graph from LatticeDB into memory when
+// the storage is in lazyNative mode, replaying any uncommitted journal changes
+// on top of the loaded graph. The caller must hold s.mu.Lock().
+func (s *GraphStorage) ensureLoadedLocked() error {
+	if !s.lazyNative {
+		return nil
+	}
+	pendingJournal := s.journal
+	pendingNodes := s.nodes
+	wasDirty := s.dirty
+
+	baseNodes, baseOut, baseIn, err := loadFromLatticeDB(s.latticePath)
+	if err != nil {
+		return err
+	}
+
+	s.lazyNative = false
+	s.lazyNodeCache = make(map[string]*NodeData)
+	s.nodes = baseNodes
+	s.outEdges = baseOut
+	s.inEdges = baseIn
+	s.rebuildIndexesLocked()
+	s.bm25.Clear()
+	s.bm25Loaded = false
+	s.countsValid = false
+
+	if !wasDirty || pendingJournal == nil {
+		s.dirty = false
+		s.journal = nil
+		return nil
+	}
+
+	// Replay pending journal mutations onto the newly hydrated base graph.
+	s.journal = &graphJournal{
+		nodes:        make(map[string]nodeMutation, len(pendingJournal.nodes)),
+		edges:        make(map[string]edgeMutation, len(pendingJournal.edges)),
+		forceRebuild: pendingJournal.forceRebuild,
+	}
+
+	for key, mut := range pendingJournal.edges {
+		if !mut.delete {
+			continue
+		}
+		parts := strings.SplitN(key, "\x00", 3)
+		if len(parts) == 3 {
+			s.removeSpecificEdgeLocked(parts[0], parts[2], parts[1])
+		}
+		s.journal.edges[key] = mut
+	}
+	for id, mut := range pendingJournal.nodes {
+		if mut.delete {
+			s.deleteNodeLocked(id)
+			s.journal.nodes[id] = mut
+		}
+	}
+	for id, mut := range pendingJournal.nodes {
+		if mut.delete {
+			continue
+		}
+		if n, ok := pendingNodes[id]; ok {
+			if old, exists := s.nodes[id]; exists {
+				s.unindexNodeLocked(old)
+			}
+			s.nodes[id] = n
+			s.indexNodeSecondaryLocked(n)
+		}
+		s.journal.nodes[id] = mut
+	}
+	for key, mut := range pendingJournal.edges {
+		if mut.delete {
+			continue
+		}
+		parts := strings.SplitN(key, "\x00", 3)
+		if len(parts) == 3 {
+			src, typ, tgt := parts[0], parts[1], parts[2]
+			if _, exists := s.edgeIndex[key]; exists {
+				s.updateEdgeLocked(src, tgt, typ, mut.props)
+			} else {
+				edge := models.GraphEdge{
+					SourceID:   src,
+					TargetID:   tgt,
+					EdgeType:   typ,
+					Properties: copyProperties(mut.props),
+				}
+				s.outEdges[src] = append(s.outEdges[src], edge)
+				s.inEdges[tgt] = append(s.inEdges[tgt], edge)
+				s.indexEdgeLocked(key, typ)
+			}
+		}
+		s.journal.edges[key] = mut
+	}
+	s.dirty = true
+	s.countsValid = false
+	return nil
+}
+
+func (s *GraphStorage) removeSpecificEdgeLocked(sourceID, targetID, edgeType string) {
+	key := edgeKey(sourceID, targetID, edgeType)
+	s.unindexEdgeLocked(key, edgeType)
+	if outList, ok := s.outEdges[sourceID]; ok {
+		var updated []models.GraphEdge
+		for _, e := range outList {
+			if !(e.TargetID == targetID && e.EdgeType == edgeType) {
+				updated = append(updated, e)
+			}
+		}
+		s.outEdges[sourceID] = updated
+	}
+	if inList, ok := s.inEdges[targetID]; ok {
+		var updated []models.GraphEdge
+		for _, e := range inList {
+			if !(e.SourceID == sourceID && e.EdgeType == edgeType) {
+				updated = append(updated, e)
+			}
+		}
+		s.inEdges[targetID] = updated
+	}
 }
 
 func (s *GraphStorage) Save() error {
@@ -243,6 +419,12 @@ func (s *GraphStorage) Save() error {
 		s.lastSaveMode, s.lastSaveOps = mode, ops
 		s.dirty = false
 		s.journal = nil
+		s.countsValid = false
+		if s.lazyNative {
+			// Clear the in-memory delta overlay so future queries read from the
+			// freshly updated native database.
+			s.clearInMemoryMapsLocked()
+		}
 		if mtime, ok := storageMtime(s.latticePath); ok {
 			s.loadedMtime = mtime
 		}
@@ -295,6 +477,11 @@ func (s *GraphStorage) saveNativeLocked() (mode string, ops int, err error) {
 	ops = s.journal.ops()
 
 	rebuild := func() (string, int, error) {
+		if s.lazyNative {
+			if err := s.ensureLoadedLocked(); err != nil {
+				return "", ops, err
+			}
+		}
 		if err := saveToLatticeDB(s.latticePath, s.nodes, s.outEdges); err != nil {
 			return "", ops, err
 		}
@@ -370,6 +557,7 @@ func (s *GraphStorage) ReloadIfModified() bool {
 func (s *GraphStorage) ensureBM25Indexed() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	_ = s.ensureLoadedLocked()
 	if s.bm25Loaded {
 		return
 	}
@@ -398,6 +586,29 @@ func (s *GraphStorage) DatabaseEngine() string {
 	return "Embedded Go Property-Graph"
 }
 
+func shortSymbolName(name string) string {
+	if idx := strings.LastIndex(name, "."); idx != -1 {
+		return name[idx+1:]
+	}
+	return name
+}
+
+func buildNodeSearchText(properties map[string]any) string {
+	name, _ := properties["name"].(string)
+	sig, _ := properties["signature"].(string)
+	doc, _ := properties["docstring"].(string)
+	fpath, _ := properties["file_path"].(string)
+	if fpath == "" {
+		fpath, _ = properties["path"].(string)
+	}
+	raw := fmt.Sprintf("%s %s %s %s", name, sig, doc, fpath)
+	tokens := tokenize(raw)
+	if len(tokens) == 0 {
+		return ""
+	}
+	return strings.Join(tokens, " ")
+}
+
 func (s *GraphStorage) indexNodeBM25(n *NodeData) {
 	name, _ := n.Properties["name"].(string)
 	sig, _ := n.Properties["signature"].(string)
@@ -410,17 +621,103 @@ func (s *GraphStorage) indexNodeBM25(n *NodeData) {
 	s.bm25.IndexDocument(n.ID, text)
 }
 
+func (s *GraphStorage) indexNodeSecondaryLocked(n *NodeData) {
+	if n == nil {
+		return
+	}
+	lvl, _ := n.Properties["level"].(string)
+	if lvl != "" {
+		set, ok := s.byLevel[lvl]
+		if !ok {
+			set = make(map[string]struct{})
+			s.byLevel[lvl] = set
+		}
+		set[n.ID] = struct{}{}
+	}
+	if lvl == string(models.LevelL1) {
+		if p, _ := n.Properties["path"].(string); p != "" {
+			s.byModulePath[p] = n.ID
+		}
+	}
+	if name, _ := n.Properties["name"].(string); name != "" {
+		s.addSymbolNameIndexLocked(name, n.ID)
+		if short := shortSymbolName(name); short != "" && short != name {
+			s.addSymbolNameIndexLocked(short, n.ID)
+		}
+	}
+}
+
+func (s *GraphStorage) addSymbolNameIndexLocked(key, id string) {
+	set, ok := s.bySymbolName[key]
+	if !ok {
+		set = make(map[string]struct{})
+		s.bySymbolName[key] = set
+	}
+	set[id] = struct{}{}
+}
+
+func (s *GraphStorage) unindexNodeLocked(n *NodeData) {
+	if n == nil {
+		return
+	}
+	if lvl, _ := n.Properties["level"].(string); lvl != "" {
+		if set, ok := s.byLevel[lvl]; ok {
+			delete(set, n.ID)
+		}
+		if lvl == string(models.LevelL1) {
+			if p, _ := n.Properties["path"].(string); p != "" && s.byModulePath[p] == n.ID {
+				delete(s.byModulePath, p)
+			}
+		}
+	}
+	if name, _ := n.Properties["name"].(string); name != "" {
+		if set, ok := s.bySymbolName[name]; ok {
+			delete(set, n.ID)
+		}
+		if short := shortSymbolName(name); short != "" {
+			if set, ok := s.bySymbolName[short]; ok {
+				delete(set, n.ID)
+			}
+		}
+	}
+}
+
+func (s *GraphStorage) indexEdgeLocked(key, edgeType string) {
+	s.edgeIndex[key] = struct{}{}
+	set, ok := s.edgesByType[edgeType]
+	if !ok {
+		set = make(map[string]struct{})
+		s.edgesByType[edgeType] = set
+	}
+	set[key] = struct{}{}
+}
+
+func (s *GraphStorage) unindexEdgeLocked(key, edgeType string) {
+	delete(s.edgeIndex, key)
+	if set, ok := s.edgesByType[edgeType]; ok {
+		delete(set, key)
+	}
+}
+
 // edgeKey identifies a directed, typed edge between two nodes.
 func edgeKey(sourceID, targetID, edgeType string) string {
 	return sourceID + "\x00" + edgeType + "\x00" + targetID
 }
 
-// rebuildEdgeIndexLocked re-creates the edge lookup from the edge lists.
-func (s *GraphStorage) rebuildEdgeIndexLocked() {
+// rebuildIndexesLocked re-creates the secondary node and edge lookups.
+func (s *GraphStorage) rebuildIndexesLocked() {
 	s.edgeIndex = make(map[string]struct{}, len(s.outEdges))
+	s.edgesByType = make(map[string]map[string]struct{})
+	s.byLevel = make(map[string]map[string]struct{})
+	s.bySymbolName = make(map[string]map[string]struct{})
+	s.byModulePath = make(map[string]string)
+
+	for _, n := range s.nodes {
+		s.indexNodeSecondaryLocked(n)
+	}
 	for src, list := range s.outEdges {
 		for _, e := range list {
-			s.edgeIndex[edgeKey(src, e.TargetID, e.EdgeType)] = struct{}{}
+			s.indexEdgeLocked(edgeKey(src, e.TargetID, e.EdgeType), e.EdgeType)
 		}
 	}
 }
@@ -447,7 +744,13 @@ func (s *GraphStorage) journalOverflowLocked() {
 	if j == nil || j.forceRebuild {
 		return
 	}
-	limit := (len(s.nodes) + len(s.edgeIndex)) / 4
+	totalItems := len(s.nodes) + len(s.edgeIndex)
+	if s.countsValid {
+		if c := s.counts["total_nodes"] + s.counts["total_edges"]; c > totalItems {
+			totalItems = c
+		}
+	}
+	limit := totalItems / 4
 	if limit < 2000 {
 		limit = 2000
 	}
@@ -509,19 +812,26 @@ func (s *GraphStorage) CreateNode(id string, labels []string, properties map[str
 	defer s.mu.Unlock()
 
 	s.markDirtyLocked()
-	propsCopy := make(map[string]any, len(properties))
+	propsCopy := make(map[string]any, len(properties)+2)
 	for k, v := range properties {
 		propsCopy[k] = v
 	}
 	propsCopy["id"] = id
 	propsCopy["labels"] = labels
 
+	if old, exists := s.nodes[id]; exists {
+		s.unindexNodeLocked(old)
+	}
 	node := &NodeData{
 		ID:         id,
 		Labels:     labels,
 		Properties: propsCopy,
 	}
 	s.nodes[id] = node
+	if s.lazyNodeCache != nil {
+		s.lazyNodeCache[id] = node
+	}
+	s.indexNodeSecondaryLocked(node)
 	s.journalNodeUpsertLocked(id, labels)
 	if s.bm25Loaded {
 		s.indexNodeBM25(node)
@@ -531,38 +841,88 @@ func (s *GraphStorage) CreateNode(id string, labels []string, properties map[str
 // HasNode reports whether a node with the given ID exists.
 func (s *GraphStorage) HasNode(id string) bool {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-	_, exists := s.nodes[id]
-	return exists
+	if _, exists := s.nodes[id]; exists {
+		s.mu.RUnlock()
+		return true
+	}
+	if !s.lazyNative {
+		s.mu.RUnlock()
+		return false
+	}
+	if s.journal != nil {
+		if mut, ok := s.journal.nodes[id]; ok && mut.delete {
+			s.mu.RUnlock()
+			return false
+		}
+	}
+	if s.lazyNodeCache != nil {
+		if _, ok := s.lazyNodeCache[id]; ok {
+			s.mu.RUnlock()
+			return true
+		}
+	}
+	latticePath := s.latticePath
+	s.mu.RUnlock()
+
+	return hasNodeInLatticeDB(latticePath, id)
 }
 
 func (s *GraphStorage) GetNode(id string) (map[string]any, bool) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	node, exists := s.nodes[id]
-	if !exists {
+	if node, exists := s.nodes[id]; exists {
+		res := copyProperties(node.Properties)
+		s.mu.RUnlock()
+		return res, true
+	}
+	if !s.lazyNative {
+		s.mu.RUnlock()
 		return nil, false
 	}
-	res := make(map[string]any, len(node.Properties))
-	for k, v := range node.Properties {
-		res[k] = v
+	if s.journal != nil {
+		if mut, ok := s.journal.nodes[id]; ok && mut.delete {
+			s.mu.RUnlock()
+			return nil, false
+		}
 	}
-	return res, true
+	if s.lazyNodeCache != nil {
+		if cached, ok := s.lazyNodeCache[id]; ok {
+			res := copyProperties(cached.Properties)
+			s.mu.RUnlock()
+			return res, true
+		}
+	}
+	latticePath := s.latticePath
+	s.mu.RUnlock()
+
+	node, ok := getNodeFromLatticeDB(latticePath, id)
+	if !ok || node == nil {
+		return nil, false
+	}
+
+	s.mu.Lock()
+	if s.lazyNative && s.lazyNodeCache != nil {
+		s.lazyNodeCache[id] = node
+	}
+	s.mu.Unlock()
+	return copyProperties(node.Properties), true
 }
 
 func (s *GraphStorage) DeleteNode(id string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.DeleteNodes([]string{id})
+}
 
+func (s *GraphStorage) deleteNodeLocked(id string) {
 	existing, exists := s.nodes[id]
 	if !exists {
-		// Nothing to remove; deleting a node twice must not dirty the graph.
 		return
 	}
 
 	s.markDirtyLocked()
+	s.unindexNodeLocked(existing)
 	delete(s.nodes, id)
+	if s.lazyNodeCache != nil {
+		delete(s.lazyNodeCache, id)
+	}
 	if s.bm25Loaded {
 		s.bm25.RemoveDocument(id)
 	}
@@ -570,13 +930,14 @@ func (s *GraphStorage) DeleteNode(id string) {
 	// LatticeDB does not cascade edge removal, so every incident edge is
 	// journaled for deletion before the node itself goes away.
 	s.journalNodeDeleteLocked(id, existing.Labels)
+	s.removeIncidentEdgesInMemoryLocked(id)
+}
 
-	// Remove outgoing edges
+func (s *GraphStorage) removeIncidentEdgesInMemoryLocked(id string) {
 	if outList, ok := s.outEdges[id]; ok {
 		for _, e := range outList {
-			delete(s.edgeIndex, edgeKey(id, e.TargetID, e.EdgeType))
+			s.unindexEdgeLocked(edgeKey(id, e.TargetID, e.EdgeType), e.EdgeType)
 			s.journalEdgeDeleteLocked(id, e.TargetID, e.EdgeType)
-			// Remove from target's inEdges
 			inList := s.inEdges[e.TargetID]
 			var updated []models.GraphEdge
 			for _, inE := range inList {
@@ -589,12 +950,10 @@ func (s *GraphStorage) DeleteNode(id string) {
 		delete(s.outEdges, id)
 	}
 
-	// Remove incoming edges
 	if inList, ok := s.inEdges[id]; ok {
 		for _, e := range inList {
-			delete(s.edgeIndex, edgeKey(e.SourceID, id, e.EdgeType))
+			s.unindexEdgeLocked(edgeKey(e.SourceID, id, e.EdgeType), e.EdgeType)
 			s.journalEdgeDeleteLocked(e.SourceID, id, e.EdgeType)
-			// Remove from source's outEdges
 			outList := s.outEdges[e.SourceID]
 			var updated []models.GraphEdge
 			for _, outE := range outList {
@@ -612,13 +971,75 @@ func (s *GraphStorage) DeleteNode(id string) {
 // IDs (for example from the cache state) should prefer this over
 // DeleteFileSubnodes, which has to scan every node in the graph.
 func (s *GraphStorage) DeleteNodes(ids []string) {
+	if len(ids) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !s.lazyNative {
+		for _, id := range ids {
+			s.deleteNodeLocked(id)
+		}
+		return
+	}
+
+	var checkDiskIDs []string
 	for _, id := range ids {
-		s.DeleteNode(id)
+		if s.journal != nil {
+			if mut, ok := s.journal.nodes[id]; ok && mut.delete {
+				continue
+			}
+		}
+		checkDiskIDs = append(checkDiskIDs, id)
+	}
+	snaps := inspectNodesInLatticeDB(s.latticePath, checkDiskIDs)
+
+	for _, id := range ids {
+		existing, inMem := s.nodes[id]
+		snap, onDisk := snaps[id]
+		if s.journal != nil {
+			if mut, ok := s.journal.nodes[id]; ok && mut.delete {
+				onDisk = false
+			}
+		}
+		if !inMem && !onDisk {
+			continue
+		}
+
+		s.markDirtyLocked()
+		var labels []string
+		if inMem {
+			labels = existing.Labels
+			s.unindexNodeLocked(existing)
+			delete(s.nodes, id)
+		} else {
+			labels = snap.labels
+		}
+		if s.lazyNodeCache != nil {
+			delete(s.lazyNodeCache, id)
+		}
+		if s.bm25Loaded {
+			s.bm25.RemoveDocument(id)
+		}
+
+		s.journalNodeDeleteLocked(id, labels)
+		s.removeIncidentEdgesInMemoryLocked(id)
+
+		if onDisk {
+			for _, e := range snap.outEdges {
+				s.journalEdgeDeleteLocked(id, e.TargetID, e.EdgeType)
+			}
+			for _, e := range snap.inEdges {
+				s.journalEdgeDeleteLocked(e.SourceID, id, e.EdgeType)
+			}
+		}
 	}
 }
 
 func (s *GraphStorage) DeleteFileSubnodes(filePath string) {
-	s.mu.RLock()
+	s.mu.Lock()
+	_ = s.ensureLoadedLocked()
 	var toDelete []string
 	for id, n := range s.nodes {
 		fPath, _ := n.Properties["file_path"].(string)
@@ -627,11 +1048,10 @@ func (s *GraphStorage) DeleteFileSubnodes(filePath string) {
 			toDelete = append(toDelete, id)
 		}
 	}
-	s.mu.RUnlock()
-
 	for _, id := range toDelete {
-		s.DeleteNode(id)
+		s.deleteNodeLocked(id)
 	}
+	s.mu.Unlock()
 }
 
 func (s *GraphStorage) CreateEdge(sourceID, targetID, edgeType string, properties map[string]any) {
@@ -652,7 +1072,38 @@ func (s *GraphStorage) CreateEdge(sourceID, targetID, edgeType string, propertie
 			}
 			return
 		}
-		delete(s.edgeIndex, key)
+		s.unindexEdgeLocked(key, edgeType)
+	}
+
+	if s.lazyNative {
+		// If this edge has not been touched in the current session, check
+		// whether it already exists on disk with identical properties.
+		inJournal := false
+		if s.journal != nil {
+			if _, ok := s.journal.edges[key]; ok {
+				inJournal = true
+			}
+		}
+		if !inJournal {
+			if diskProps, existsOnDisk := getEdgePropsFromLatticeDB(s.latticePath, sourceID, targetID, edgeType); existsOnDisk {
+				propsCopy := copyProperties(properties)
+				edge := models.GraphEdge{
+					SourceID:   sourceID,
+					TargetID:   targetID,
+					EdgeType:   edgeType,
+					Properties: propsCopy,
+				}
+				s.outEdges[sourceID] = append(s.outEdges[sourceID], edge)
+				s.inEdges[targetID] = append(s.inEdges[targetID], edge)
+				s.indexEdgeLocked(key, edgeType)
+				if propertiesEqual(diskProps, propsCopy) {
+					return
+				}
+				s.markDirtyLocked()
+				s.journalEdgeUpsertLocked(sourceID, targetID, edgeType, propsCopy)
+				return
+			}
+		}
 	}
 
 	s.markDirtyLocked()
@@ -664,7 +1115,7 @@ func (s *GraphStorage) CreateEdge(sourceID, targetID, edgeType string, propertie
 	}
 	s.outEdges[sourceID] = append(s.outEdges[sourceID], edge)
 	s.inEdges[targetID] = append(s.inEdges[targetID], edge)
-	s.edgeIndex[key] = struct{}{}
+	s.indexEdgeLocked(key, edgeType)
 	s.journalEdgeUpsertLocked(sourceID, targetID, edgeType, edge.Properties)
 }
 
@@ -811,6 +1262,8 @@ func (s *GraphStorage) DeleteEdgesByType(edgeTypes ...string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	_ = s.ensureLoadedLocked()
+
 	typesSet := make(map[string]bool)
 	for _, t := range edgeTypes {
 		typesSet[t] = true
@@ -821,7 +1274,7 @@ func (s *GraphStorage) DeleteEdgesByType(edgeTypes ...string) {
 		var updated []models.GraphEdge
 		for _, e := range list {
 			if typesSet[e.EdgeType] {
-				delete(s.edgeIndex, edgeKey(src, e.TargetID, e.EdgeType))
+				s.unindexEdgeLocked(edgeKey(src, e.TargetID, e.EdgeType), e.EdgeType)
 				s.journalEdgeDeleteLocked(src, e.TargetID, e.EdgeType)
 				removed = true
 				continue
@@ -861,7 +1314,7 @@ func (s *GraphStorage) DeleteEdgesForSource(sourceID string, edgeTypes ...string
 		var remaining []models.GraphEdge
 		for _, e := range outList {
 			if len(typesSet) == 0 || typesSet[e.EdgeType] {
-				delete(s.edgeIndex, edgeKey(sourceID, e.TargetID, e.EdgeType))
+				s.unindexEdgeLocked(edgeKey(sourceID, e.TargetID, e.EdgeType), e.EdgeType)
 				s.journalEdgeDeleteLocked(sourceID, e.TargetID, e.EdgeType)
 				removed = true
 				inList := s.inEdges[e.TargetID]
@@ -877,6 +1330,22 @@ func (s *GraphStorage) DeleteEdgesForSource(sourceID string, edgeTypes ...string
 			}
 		}
 		s.outEdges[sourceID] = remaining
+	}
+
+	if s.lazyNative {
+		diskEdges, _ := getOutgoingEdgesFromLatticeDB(s.latticePath, sourceID, "")
+		for _, e := range diskEdges {
+			if len(typesSet) == 0 || typesSet[e.EdgeType] {
+				key := edgeKey(sourceID, e.TargetID, e.EdgeType)
+				if s.journal != nil {
+					if mut, ok := s.journal.edges[key]; ok && mut.delete {
+						continue
+					}
+				}
+				s.journalEdgeDeleteLocked(sourceID, e.TargetID, e.EdgeType)
+				removed = true
+			}
+		}
 	}
 
 	if removed {
@@ -899,7 +1368,7 @@ func (s *GraphStorage) DeleteEdgesForTarget(targetID string, edgeTypes ...string
 		var remaining []models.GraphEdge
 		for _, e := range inList {
 			if len(typesSet) == 0 || typesSet[e.EdgeType] {
-				delete(s.edgeIndex, edgeKey(e.SourceID, targetID, e.EdgeType))
+				s.unindexEdgeLocked(edgeKey(e.SourceID, targetID, e.EdgeType), e.EdgeType)
 				s.journalEdgeDeleteLocked(e.SourceID, targetID, e.EdgeType)
 				removed = true
 				outList := s.outEdges[e.SourceID]
@@ -917,13 +1386,59 @@ func (s *GraphStorage) DeleteEdgesForTarget(targetID string, edgeTypes ...string
 		s.inEdges[targetID] = remaining
 	}
 
+	if s.lazyNative {
+		diskEdges, _ := getIncomingEdgesFromLatticeDB(s.latticePath, targetID, "")
+		for _, e := range diskEdges {
+			if len(typesSet) == 0 || typesSet[e.EdgeType] {
+				key := edgeKey(e.SourceID, targetID, e.EdgeType)
+				if s.journal != nil {
+					if mut, ok := s.journal.edges[key]; ok && mut.delete {
+						continue
+					}
+				}
+				s.journalEdgeDeleteLocked(e.SourceID, targetID, e.EdgeType)
+				removed = true
+			}
+		}
+	}
+
 	if removed {
 		s.markDirtyLocked()
 	}
 }
 
+func (s *GraphStorage) cacheNeighborNodes(neighbors []*NodeData) {
+	if len(neighbors) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.lazyNative || s.lazyNodeCache == nil {
+		return
+	}
+	for _, n := range neighbors {
+		if n != nil && n.ID != "" {
+			s.lazyNodeCache[n.ID] = n
+		}
+	}
+}
+
 func (s *GraphStorage) GetOutgoingEdges(nodeID string, edgeType string) []models.GraphEdge {
 	s.mu.RLock()
+	if s.lazyNative && !s.dirty {
+		latticePath := s.latticePath
+		s.mu.RUnlock()
+		edges, neighbors := getOutgoingEdgesFromLatticeDB(latticePath, nodeID, edgeType)
+		s.cacheNeighborNodes(neighbors)
+		return edges
+	}
+	if s.lazyNative && s.dirty {
+		s.mu.RUnlock()
+		s.mu.Lock()
+		_ = s.ensureLoadedLocked()
+		s.mu.Unlock()
+		s.mu.RLock()
+	}
 	defer s.mu.RUnlock()
 
 	var result []models.GraphEdge
@@ -937,6 +1452,20 @@ func (s *GraphStorage) GetOutgoingEdges(nodeID string, edgeType string) []models
 
 func (s *GraphStorage) GetIncomingEdges(nodeID string, edgeType string) []models.GraphEdge {
 	s.mu.RLock()
+	if s.lazyNative && !s.dirty {
+		latticePath := s.latticePath
+		s.mu.RUnlock()
+		edges, neighbors := getIncomingEdgesFromLatticeDB(latticePath, nodeID, edgeType)
+		s.cacheNeighborNodes(neighbors)
+		return edges
+	}
+	if s.lazyNative && s.dirty {
+		s.mu.RUnlock()
+		s.mu.Lock()
+		_ = s.ensureLoadedLocked()
+		s.mu.Unlock()
+		s.mu.RLock()
+	}
 	defer s.mu.RUnlock()
 
 	var result []models.GraphEdge
@@ -950,6 +1479,18 @@ func (s *GraphStorage) GetIncomingEdges(nodeID string, edgeType string) []models
 
 func (s *GraphStorage) GetEdgesByType(edgeType string) []models.GraphEdge {
 	s.mu.RLock()
+	if s.lazyNative && !s.dirty {
+		latticePath := s.latticePath
+		s.mu.RUnlock()
+		return getEdgesByTypeFromLatticeDB(latticePath, edgeType)
+	}
+	if s.lazyNative && s.dirty {
+		s.mu.RUnlock()
+		s.mu.Lock()
+		_ = s.ensureLoadedLocked()
+		s.mu.Unlock()
+		s.mu.RLock()
+	}
 	defer s.mu.RUnlock()
 
 	var result []models.GraphEdge
@@ -964,6 +1505,17 @@ func (s *GraphStorage) GetEdgesByType(edgeType string) []models.GraphEdge {
 }
 
 func (s *GraphStorage) FTSSearch(queryText string, limit int) []map[string]any {
+	s.mu.RLock()
+	isLazy := s.lazyNative && !s.dirty
+	latticePath := s.latticePath
+	s.mu.RUnlock()
+
+	if isLazy {
+		if results, ok := ftsSearchInLatticeDB(latticePath, queryText, limit); ok {
+			return results
+		}
+	}
+
 	s.ensureBM25Indexed()
 	matches := s.bm25.Search(queryText, limit)
 	s.mu.RLock()
@@ -985,7 +1537,40 @@ func (s *GraphStorage) FTSSearch(queryText string, limit int) []map[string]any {
 
 func (s *GraphStorage) FindNodesByLabelProperty(label string, key string, value any, limit int) []map[string]any {
 	s.mu.RLock()
+	if s.lazyNative && !s.dirty {
+		latticePath := s.latticePath
+		s.mu.RUnlock()
+		if nodes, supported := findNodesByLabelPropertyInLatticeDB(latticePath, label, key, value, limit); supported {
+			s.cacheNeighborNodes(nodes)
+			results := make([]map[string]any, 0, len(nodes))
+			for _, n := range nodes {
+				results = append(results, copyProperties(n.Properties))
+			}
+			return results
+		}
+		s.mu.Lock()
+		_ = s.ensureLoadedLocked()
+		s.mu.Unlock()
+		s.mu.RLock()
+	} else if s.lazyNative && s.dirty {
+		s.mu.RUnlock()
+		s.mu.Lock()
+		_ = s.ensureLoadedLocked()
+		s.mu.Unlock()
+		s.mu.RLock()
+	}
 	defer s.mu.RUnlock()
+
+	if label == "L1Module" && key == "path" {
+		if pathStr, ok := value.(string); ok {
+			if id, exists := s.byModulePath[pathStr]; exists {
+				if n, ok := s.nodes[id]; ok {
+					return []map[string]any{copyProperties(n.Properties)}
+				}
+			}
+			return nil
+		}
+	}
 
 	var results []map[string]any
 	for _, n := range s.nodes {
@@ -997,11 +1582,7 @@ func (s *GraphStorage) FindNodesByLabelProperty(label string, key string, value 
 			}
 		}
 		if hasLabel && n.Properties[key] == value {
-			res := make(map[string]any, len(n.Properties))
-			for k, v := range n.Properties {
-				res[k] = v
-			}
-			results = append(results, res)
+			results = append(results, copyProperties(n.Properties))
 			if limit > 0 && len(results) >= limit {
 				break
 			}
@@ -1010,29 +1591,112 @@ func (s *GraphStorage) FindNodesByLabelProperty(label string, key string, value 
 	return results
 }
 
-func (s *GraphStorage) QueryNodes(level string, domain string, limit int) []map[string]any {
+// FindSymbolsByName looks up symbols (and classes) whose name equals name or
+// ends with "."+name, optionally filtered by filePath. It uses B-Tree indexes
+// in native mode and the in-memory symbol index when hydrated.
+func (s *GraphStorage) FindSymbolsByName(name string, filePath string) []map[string]any {
+	if name == "" {
+		return nil
+	}
 	s.mu.RLock()
+	if s.lazyNative && !s.dirty {
+		latticePath := s.latticePath
+		s.mu.RUnlock()
+		nodes := findSymbolsByNameInLatticeDB(latticePath, name, filePath)
+		s.cacheNeighborNodes(nodes)
+		results := make([]map[string]any, 0, len(nodes))
+		for _, n := range nodes {
+			results = append(results, copyProperties(n.Properties))
+		}
+		return results
+	}
+	if s.lazyNative && s.dirty {
+		s.mu.RUnlock()
+		s.mu.Lock()
+		_ = s.ensureLoadedLocked()
+		s.mu.Unlock()
+		s.mu.RLock()
+	}
 	defer s.mu.RUnlock()
 
+	short := shortSymbolName(name)
+	candidateIDs := s.bySymbolName[short]
+	if len(candidateIDs) == 0 {
+		candidateIDs = s.bySymbolName[name]
+	}
+
 	var results []map[string]any
-	for _, n := range s.nodes {
-		if level != "" {
-			lvl, _ := n.Properties["level"].(string)
-			if lvl != level {
+	for id := range candidateIDs {
+		n, ok := s.nodes[id]
+		if !ok {
+			continue
+		}
+		nName, _ := n.Properties["name"].(string)
+		if nName != name && !strings.HasSuffix(nName, "."+name) {
+			continue
+		}
+		if filePath != "" {
+			fPath, _ := n.Properties["file_path"].(string)
+			if fPath != filePath {
 				continue
 			}
 		}
+		results = append(results, copyProperties(n.Properties))
+	}
+	return results
+}
+
+func (s *GraphStorage) QueryNodes(level string, domain string, limit int) []map[string]any {
+	s.mu.RLock()
+	if s.lazyNative && !s.dirty {
+		latticePath := s.latticePath
+		s.mu.RUnlock()
+		nodes := queryNodesFromLatticeDB(latticePath, level, domain, limit)
+		s.cacheNeighborNodes(nodes)
+		results := make([]map[string]any, 0, len(nodes))
+		for _, n := range nodes {
+			results = append(results, copyProperties(n.Properties))
+		}
+		return results
+	}
+	if s.lazyNative && s.dirty {
+		s.mu.RUnlock()
+		s.mu.Lock()
+		_ = s.ensureLoadedLocked()
+		s.mu.Unlock()
+		s.mu.RLock()
+	}
+	defer s.mu.RUnlock()
+
+	var results []map[string]any
+	if level != "" {
+		for id := range s.byLevel[level] {
+			n, ok := s.nodes[id]
+			if !ok {
+				continue
+			}
+			if domain != "" {
+				dom, _ := n.Properties["domain"].(string)
+				if dom != domain {
+					continue
+				}
+			}
+			results = append(results, copyProperties(n.Properties))
+			if limit > 0 && len(results) >= limit {
+				break
+			}
+		}
+		return results
+	}
+
+	for _, n := range s.nodes {
 		if domain != "" {
 			dom, _ := n.Properties["domain"].(string)
 			if dom != domain {
 				continue
 			}
 		}
-		res := make(map[string]any, len(n.Properties))
-		for k, v := range n.Properties {
-			res[k] = v
-		}
-		results = append(results, res)
+		results = append(results, copyProperties(n.Properties))
 		if limit > 0 && len(results) >= limit {
 			break
 		}
@@ -1045,29 +1709,27 @@ func (s *GraphStorage) CountNodesAndEdges() map[string]int {
 	defer s.mu.Unlock()
 
 	if !s.countsValid {
-		l0, l1, l2, l3 := 0, 0, 0, 0
-		for _, n := range s.nodes {
-			lvl, _ := n.Properties["level"].(string)
-			switch lvl {
-			case string(models.LevelL0):
-				l0++
-			case string(models.LevelL1):
-				l1++
-			case string(models.LevelL2):
-				l2++
-			case string(models.LevelL3):
-				l3++
+		if s.lazyNative && !s.dirty {
+			if counts, ok := countNodesAndEdgesInLatticeDB(s.latticePath); ok {
+				s.counts = counts
+				s.countsValid = true
+			} else {
+				_ = s.ensureLoadedLocked()
 			}
+		} else if s.lazyNative && s.dirty {
+			_ = s.ensureLoadedLocked()
 		}
+	}
 
-		totalEdges := 0
-		for _, list := range s.outEdges {
-			totalEdges += len(list)
-		}
+	if !s.countsValid {
+		l0 := len(s.byLevel[string(models.LevelL0)])
+		l1 := len(s.byLevel[string(models.LevelL1)])
+		l2 := len(s.byLevel[string(models.LevelL2)])
+		l3 := len(s.byLevel[string(models.LevelL3)])
 
 		s.counts = map[string]int{
 			"total_nodes": len(s.nodes),
-			"total_edges": totalEdges,
+			"total_edges": len(s.edgeIndex),
 			"l0_domains":  l0,
 			"l1_modules":  l1,
 			"l2_classes":  l2,
@@ -1088,6 +1750,13 @@ func (s *GraphStorage) CountNodesAndEdges() map[string]int {
 // into GraphStorage (the read lock is held for the duration of the walk).
 func (s *GraphStorage) RangeNodes(fn func(id string, props map[string]any)) {
 	s.mu.RLock()
+	if s.lazyNative {
+		s.mu.RUnlock()
+		s.mu.Lock()
+		_ = s.ensureLoadedLocked()
+		s.mu.Unlock()
+		s.mu.RLock()
+	}
 	defer s.mu.RUnlock()
 
 	for id, n := range s.nodes {
@@ -1097,21 +1766,31 @@ func (s *GraphStorage) RangeNodes(fn func(id string, props map[string]any)) {
 
 func (s *GraphStorage) AllNodes() map[string]map[string]any {
 	s.mu.RLock()
+	if s.lazyNative {
+		s.mu.RUnlock()
+		s.mu.Lock()
+		_ = s.ensureLoadedLocked()
+		s.mu.Unlock()
+		s.mu.RLock()
+	}
 	defer s.mu.RUnlock()
 
 	all := make(map[string]map[string]any, len(s.nodes))
 	for id, n := range s.nodes {
-		cp := make(map[string]any, len(n.Properties))
-		for k, v := range n.Properties {
-			cp[k] = v
-		}
-		all[id] = cp
+		all[id] = copyProperties(n.Properties)
 	}
 	return all
 }
 
 func (s *GraphStorage) AllEdges() []models.GraphEdge {
 	s.mu.RLock()
+	if s.lazyNative {
+		s.mu.RUnlock()
+		s.mu.Lock()
+		_ = s.ensureLoadedLocked()
+		s.mu.Unlock()
+		s.mu.RLock()
+	}
 	defer s.mu.RUnlock()
 
 	var edges []models.GraphEdge

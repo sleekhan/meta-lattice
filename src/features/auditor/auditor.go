@@ -41,24 +41,28 @@ func (a *ArchitectureBoundaryAuditor) getModuleGraph() *moduleGraph {
 		inEdges:  make(map[string][]moduleEdge),
 	}
 
-	a.db.RangeNodes(func(id string, n map[string]any) {
-		if lvl, _ := n["level"].(string); lvl != string(models.LevelL1) {
-			return
-		}
+	byID := make(map[string]map[string]any)
+	for _, n := range a.db.QueryNodes(string(models.LevelL1), "", 0) {
+		id, _ := n["id"].(string)
 		filePath, _ := n["path"].(string)
 		if filePath == "" {
 			filePath = strings.TrimPrefix(id, "file:")
 		}
-		cp := make(map[string]any, len(n))
-		for k, v := range n {
-			cp[k] = v
+		mg.nodes[filePath] = n
+		if id != "" {
+			byID[id] = n
 		}
-		mg.nodes[filePath] = cp
-	})
+	}
 
 	for _, e := range a.db.GetEdgesByType(string(models.EdgeImports)) {
-		srcNode, okSrc := a.db.GetNode(e.SourceID)
-		tgtNode, okTgt := a.db.GetNode(e.TargetID)
+		srcNode, okSrc := byID[e.SourceID]
+		if !okSrc {
+			srcNode, okSrc = a.db.GetNode(e.SourceID)
+		}
+		tgtNode, okTgt := byID[e.TargetID]
+		if !okTgt {
+			tgtNode, okTgt = a.db.GetNode(e.TargetID)
+		}
 		if okSrc && okTgt {
 			srcPath, _ := srcNode["path"].(string)
 			if srcPath == "" {

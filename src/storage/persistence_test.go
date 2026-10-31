@@ -303,3 +303,77 @@ func TestSaveKeepsChangesWhenDatabaseIsLocked(t *testing.T) {
 		t.Fatal("the pending change was lost")
 	}
 }
+
+func TestLazyNativeQueriesAndMutations(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "knowledge.lattice")
+	db := newNativeStorage(t, path)
+	db.CreateNode("domain:pkg", []string{"L0Domain", "Domain"}, map[string]any{
+		"level": string(models.LevelL0), "name": "pkg", "module_count": 1,
+	})
+	db.CreateNode("file:pkg/a.py", []string{"L1Module", "Module", "File"}, map[string]any{
+		"level": string(models.LevelL1), "path": "pkg/a.py", "domain": "pkg", "loc": 10,
+	})
+	db.CreateNode("symbol:pkg/a.py:AuthService.parseHTTP", []string{"L3Symbol", "Symbol", "Method"}, map[string]any{
+		"level": string(models.LevelL3), "name": "AuthService.parseHTTP", "file_path": "pkg/a.py", "code": "def parseHTTP(): pass\n",
+	})
+	db.CreateEdge("domain:pkg", "file:pkg/a.py", string(models.EdgeContains), nil)
+	db.CreateEdge("file:pkg/a.py", "symbol:pkg/a.py:AuthService.parseHTTP", string(models.EdgeContains), nil)
+	if err := db.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened := newNativeStorage(t, path)
+	if !reopened.lazyNative {
+		t.Fatal("expected reopened v2 database to start in lazyNative mode")
+	}
+	if len(reopened.nodes) != 0 {
+		t.Fatalf("expected 0 hydrated nodes on lazy open, got %d", len(reopened.nodes))
+	}
+
+	// Point lookup, B-Tree symbol lookup, FTS search, and edge traversal must
+	// all answer without hydrating the full graph into reopened.nodes.
+	if !reopened.HasNode("file:pkg/a.py") {
+		t.Fatal("HasNode failed in lazyNative mode")
+	}
+	syms := reopened.FindSymbolsByName("parseHTTP", "pkg/a.py")
+	if len(syms) != 1 {
+		t.Fatalf("FindSymbolsByName short match = %d, want 1", len(syms))
+	}
+	if len(reopened.FTSSearch("http", 5)) == 0 {
+		t.Fatal("native FTS search failed to match camelCase token 'http'")
+	}
+	if len(reopened.GetOutgoingEdges("file:pkg/a.py", string(models.EdgeContains))) != 1 {
+		t.Fatal("GetOutgoingEdges failed in lazyNative mode")
+	}
+	counts := reopened.CountNodesAndEdges()
+	if counts["total_nodes"] != 3 || counts["total_edges"] != 2 {
+		t.Fatalf("CountNodesAndEdges in lazyNative mode = %v", counts)
+	}
+	if len(reopened.nodes) != 0 {
+		t.Fatalf("read queries in lazyNative mode hydrated %d nodes into s.nodes", len(reopened.nodes))
+	}
+
+	// Incremental mutation on a lazyNative instance must stay lazy and update
+	// disk counts without hydrating the whole graph.
+	reopened.CreateNode("file:pkg/b.py", []string{"L1Module", "Module", "File"}, map[string]any{
+		"level": string(models.LevelL1), "path": "pkg/b.py", "domain": "pkg", "loc": 5,
+	})
+	reopened.CreateEdge("domain:pkg", "file:pkg/b.py", string(models.EdgeContains), nil)
+	reopened.CreateEdge("file:pkg/b.py", "file:pkg/a.py", string(models.EdgeImports), map[string]any{"spec": "./a"})
+	if err := reopened.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if mode := reopened.LastSaveMode(); mode != "incremental" {
+		t.Fatalf("expected incremental save from lazyNative mode, got %q", mode)
+	}
+	if !reopened.lazyNative {
+		t.Fatal("expected lazyNative mode to remain active after incremental Save")
+	}
+	counts = reopened.CountNodesAndEdges()
+	if counts["total_nodes"] != 4 || counts["total_edges"] != 4 {
+		t.Fatalf("unexpected counts after lazy incremental save: %v", counts)
+	}
+	if len(reopened.GetEdgesByType(string(models.EdgeImports))) != 1 {
+		t.Fatal("expected 1 IMPORTS edge in lazyNative mode")
+	}
+}
