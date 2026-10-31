@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path"
@@ -97,7 +96,11 @@ type CacheEngine struct {
 	workspaceRoot string
 	state         CacheState
 	stateSig      stateSignature
-	mu            sync.Mutex
+	// tsPathsCache avoids re-reading the TypeScript config on every import
+	// resolution; tsPathsStamp is the mtime/size fingerprint it was built from.
+	tsPathsCache map[string]string
+	tsPathsStamp string
+	mu           sync.Mutex
 }
 
 func NewCacheEngine(cfg *config.LatticeConfig, db *storage.GraphStorage) *CacheEngine {
@@ -194,18 +197,18 @@ func (e *CacheEngine) saveCacheState() error {
 	return nil
 }
 
+// ComputeFileSHABytes returns the hex SHA-256 of the given content.
+func ComputeFileSHABytes(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
 func ComputeFileSHA(filePath string) string {
-	f, err := os.Open(filePath)
+	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return ""
 	}
-	defer f.Close()
-
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return ""
-	}
-	return hex.EncodeToString(h.Sum(nil))
+	return ComputeFileSHABytes(data)
 }
 
 func (e *CacheEngine) shouldIgnore(relPath string, isDir bool) bool {
@@ -287,6 +290,9 @@ func (e *CacheEngine) scanFiles() map[string]string {
 }
 
 func (e *CacheEngine) getGitCommit() string {
+	if sha := readGitHead(e.workspaceRoot); sha != "" {
+		return sha
+	}
 	cmd := exec.Command("git", "rev-parse", "HEAD")
 	cmd.Dir = e.workspaceRoot
 	out, err := cmd.Output()
@@ -296,11 +302,78 @@ func (e *CacheEngine) getGitCommit() string {
 	return strings.TrimSpace(string(out))
 }
 
-func (e *CacheEngine) parseFile(relPath string, absPath string, sha string) *ParsedFileResult {
-	data, err := os.ReadFile(absPath)
-	if err != nil {
-		return nil
+// readGitHead resolves HEAD without spawning a subprocess, which the hook pays
+// for on every edit. It understands a plain .git directory and the "gitdir:"
+// indirection used by worktrees and submodules; anything unexpected falls back
+// to the git CLI.
+func readGitHead(root string) string {
+	gitDir := filepath.Join(root, ".git")
+	if fi, err := os.Stat(gitDir); err == nil && !fi.IsDir() {
+		data, err := os.ReadFile(gitDir)
+		if err != nil {
+			return ""
+		}
+		line := strings.TrimSpace(string(data))
+		if !strings.HasPrefix(line, "gitdir:") {
+			return ""
+		}
+		gitDir = strings.TrimSpace(strings.TrimPrefix(line, "gitdir:"))
+		if !filepath.IsAbs(gitDir) {
+			gitDir = filepath.Join(root, gitDir)
+		}
 	}
+
+	head, err := os.ReadFile(filepath.Join(gitDir, "HEAD"))
+	if err != nil {
+		return ""
+	}
+	ref := strings.TrimSpace(string(head))
+	if !strings.HasPrefix(ref, "ref:") {
+		if isHexSHA(ref) {
+			return ref
+		}
+		return ""
+	}
+
+	refPath := strings.TrimSpace(strings.TrimPrefix(ref, "ref:"))
+	if data, err := os.ReadFile(filepath.Join(gitDir, filepath.FromSlash(refPath))); err == nil {
+		if sha := strings.TrimSpace(string(data)); isHexSHA(sha) {
+			return sha
+		}
+	}
+
+	// The ref may live in packed-refs (fresh clones, after gc).
+	packed, err := os.ReadFile(filepath.Join(gitDir, "packed-refs"))
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(packed), "\n") {
+		if strings.HasPrefix(line, "#") || strings.HasPrefix(line, "^") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) == 2 && fields[1] == refPath && isHexSHA(fields[0]) {
+			return fields[0]
+		}
+	}
+	return ""
+}
+
+func isHexSHA(s string) bool {
+	if len(s) != 40 {
+		return false
+	}
+	for _, c := range s {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// parseFileData parses already-read file content, so callers that also need the
+// SHA-256 do not have to read the file twice.
+func (e *CacheEngine) parseFileData(relPath string, absPath string, data []byte, sha string) *ParsedFileResult {
 	sourceCode := string(data)
 	ext := strings.ToLower(filepath.Ext(absPath))
 	domain := GetDomainFromPath(relPath)
@@ -333,6 +406,36 @@ func (e *CacheEngine) parseFile(relPath string, absPath string, sha string) *Par
 	default:
 		return nil
 	}
+}
+
+// cacheDomain returns the domain recorded for a cached file, falling back to the
+// path-derived domain for entries written by older cache versions.
+func cacheDomain(rel string, info CacheFileInfo) string {
+	if info.Domain != "" {
+		return info.Domain
+	}
+	return GetDomainFromPath(rel)
+}
+
+// upsertDomain writes the L0 node for a domain with the given module count, or
+// removes it once the domain no longer owns any file. Both Sync and
+// SyncTargetFile go through here so the stored module_count cannot drift.
+func (e *CacheEngine) upsertDomain(domain string, moduleCount int) {
+	domID := "domain:" + domain
+	if moduleCount == 0 {
+		e.db.DeleteNode(domID)
+		return
+	}
+	l0 := models.L0DomainNode{
+		ID:          domID,
+		Name:        domain,
+		Path:        domain,
+		Description: "Domain " + domain + " containing modules",
+		ModuleCount: moduleCount,
+		Level:       string(models.LevelL0),
+		Labels:      []string{"L0Domain", "Domain"},
+	}
+	e.db.CreateNode(domID, l0.Labels, l0.ToProperties())
 }
 
 func (e *CacheEngine) Sync(force bool) SyncStats {
@@ -439,20 +542,35 @@ func (e *CacheEngine) Sync(force bool) SyncStats {
 		}
 	}
 
-	// Step 1: Clean up deleted files
+	// Step 1: Clean up deleted files. The cache state records the node IDs that
+	// were created for each file, so stale nodes can be removed directly instead
+	// of scanning the whole graph for every deleted file.
+	deletedDomains := make(map[string]bool)
 	for _, rel := range deleted {
-		e.db.DeleteFileSubnodes(rel)
+		if info, ok := cachedFiles[rel]; ok {
+			e.db.DeleteNodes(info.NodeIDs)
+			deletedDomains[cacheDomain(rel, info)] = true
+		} else {
+			e.db.DeleteFileSubnodes(rel)
+			deletedDomains[GetDomainFromPath(rel)] = true
+		}
 		delete(cachedFiles, rel)
 	}
 
 	// Step 2: Clean up modified files subnodes before parsing
 	filesToParse := append(append([]string(nil), added...), modified...)
 	for _, rel := range modified {
-		e.db.DeleteFileSubnodes(rel)
+		if info, ok := cachedFiles[rel]; ok {
+			e.db.DeleteNodes(info.NodeIDs)
+		} else {
+			e.db.DeleteFileSubnodes(rel)
+		}
 	}
 	if force {
 		for _, rel := range added {
-			e.db.DeleteFileSubnodes(rel)
+			if info, ok := cachedFiles[rel]; ok {
+				e.db.DeleteNodes(info.NodeIDs)
+			}
 		}
 	}
 
@@ -478,7 +596,11 @@ func (e *CacheEngine) Sync(force bool) SyncStats {
 		go func() {
 			defer parseWg.Done()
 			for job := range parseJobs {
-				sha := ComputeFileSHA(job.absPath)
+				data, err := os.ReadFile(job.absPath)
+				if err != nil {
+					continue
+				}
+				sha := ComputeFileSHABytes(data)
 				fi, _ := os.Stat(job.absPath)
 				var mtime int64
 				var size int64
@@ -486,7 +608,7 @@ func (e *CacheEngine) Sync(force bool) SyncStats {
 					mtime = fi.ModTime().UnixNano()
 					size = fi.Size()
 				}
-				parsed := e.parseFile(job.rel, job.absPath, sha)
+				parsed := e.parseFileData(job.rel, job.absPath, data, sha)
 				parseResults <- parseJobResult{
 					rel:   job.rel,
 					sha:   sha,
@@ -549,48 +671,47 @@ func (e *CacheEngine) Sync(force bool) SyncStats {
 	// Step 3: Ensure L0 Domain nodes
 	domainCounts := make(map[string]int)
 	for rel, info := range cachedFiles {
-		d := info.Domain
-		if d == "" {
-			d = GetDomainFromPath(rel)
-		}
-		domainCounts[d]++
+		domainCounts[cacheDomain(rel, info)]++
 	}
 
-	// Remove empty domains whose last file is gone
-	for id, n := range e.db.AllNodes() {
-		lvl, _ := n["level"].(string)
-		name, _ := n["name"].(string)
-		if lvl == string(models.LevelL0) {
-			if _, exists := domainCounts[name]; !exists {
-				e.db.DeleteNode(id)
+	// Only the domains touched by this delta need their node and links
+	// refreshed. Rewriting every domain on every sync marked the graph dirty
+	// even when nothing changed, which forced a full database rewrite.
+	dirtyDomains := deletedDomains
+	for _, rel := range append(added, modified...) {
+		if info, ok := cachedFiles[rel]; ok {
+			dirtyDomains[cacheDomain(rel, info)] = true
+		}
+	}
+
+	// A forced re-index is the point where the graph and the cache state may
+	// have drifted apart, so drop L0 nodes that no longer own any file.
+	if force {
+		var stale []string
+		e.db.RangeNodes(func(id string, props map[string]any) {
+			if lvl, _ := props["level"].(string); lvl != string(models.LevelL0) {
+				return
 			}
-		}
+			if name, _ := props["name"].(string); domainCounts[name] == 0 {
+				stale = append(stale, id)
+			}
+		})
+		e.db.DeleteNodes(stale)
 	}
 
-	// Create or update L0 domains
-	for dom, count := range domainCounts {
-		domID := "domain:" + dom
-		l0 := models.L0DomainNode{
-			ID:          domID,
-			Name:        dom,
-			Path:        dom,
-			Description: "Domain " + dom + " containing modules",
-			ModuleCount: count,
-			Level:       string(models.LevelL0),
-			Labels:      []string{"L0Domain", "Domain"},
-		}
-		e.db.CreateNode(domID, l0.Labels, l0.ToProperties())
+	for dom := range dirtyDomains {
+		// A zero count removes the domain node: the last file of that domain
+		// is gone.
+		e.upsertDomain(dom, domainCounts[dom])
 	}
 
-	// Connect L0 -> L1 edges for all current files
-	for rel, info := range cachedFiles {
-		dom := info.Domain
-		if dom == "" {
-			dom = GetDomainFromPath(rel)
+	// Connect L0 -> L1 edges for the files touched by this delta.
+	for _, rel := range append(added, modified...) {
+		info, ok := cachedFiles[rel]
+		if !ok {
+			continue
 		}
-		domID := "domain:" + dom
-		fileID := "file:" + rel
-		e.db.CreateEdge(domID, fileID, string(models.EdgeContains), nil)
+		e.db.CreateEdge("domain:"+cacheDomain(rel, info), "file:"+rel, string(models.EdgeContains), nil)
 	}
 
 	// Step 4 & 5: Resolve cross-file IMPORTS and CALLS edges
@@ -647,43 +768,59 @@ func (e *CacheEngine) Sync(force bool) SyncStats {
 	}
 }
 
+// resolveWorkspacePath maps a relative or absolute path to a workspace-relative
+// slash path and its absolute counterpart. It reports false when the path lies
+// outside the workspace, so a post-tool hook cannot pull files from another
+// project into this workspace's graph.
+func (e *CacheEngine) resolveWorkspacePath(target string) (relPath string, absPath string, ok bool) {
+	if target == "" {
+		return "", "", false
+	}
+	candidate := target
+	if !filepath.IsAbs(candidate) {
+		candidate = filepath.Join(e.workspaceRoot, filepath.FromSlash(candidate))
+	}
+	candidate = filepath.Clean(candidate)
+
+	rel, err := filepath.Rel(e.workspaceRoot, candidate)
+	if err != nil {
+		return "", "", false
+	}
+	rel = filepath.ToSlash(rel)
+	if rel == "." || rel == ".." || strings.HasPrefix(rel, "../") {
+		return "", "", false
+	}
+	return rel, candidate, true
+}
+
+// unchangedStats reports the current index state for a targeted sync that has
+// nothing to do.
+func (e *CacheEngine) unchangedStats(startTime time.Time) SyncStats {
+	return SyncStats{
+		ElapsedMS:   int(time.Since(startTime).Milliseconds()),
+		TotalFiles:  len(e.state.Files),
+		CachedCount: len(e.state.Files),
+		Nodes:       e.db.CountNodesAndEdges(),
+		GitCommit:   e.state.GitCommit,
+	}
+}
+
 // SyncTargetFile performs ultra-fast targeted incremental sync for a single file
 // (e.g. from Claude Code's post-tool hook), skipping full-directory scanning.
-func (e *CacheEngine) SyncTargetFile(relPath string) (SyncStats, error) {
+// Paths outside the workspace are ignored rather than indexed.
+func (e *CacheEngine) SyncTargetFile(target string) (SyncStats, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	startTime := time.Now()
-	cleanRel := filepath.ToSlash(filepath.Clean(relPath))
-	cleanRel = strings.TrimPrefix(cleanRel, "./")
-	cleanRel = strings.TrimPrefix(cleanRel, "/")
 
-	if filepath.IsAbs(relPath) {
-		if r, err := filepath.Rel(e.workspaceRoot, relPath); err == nil {
-			cleanRel = filepath.ToSlash(r)
-		}
+	relPath, absPath, insideWorkspace := e.resolveWorkspacePath(target)
+	if !insideWorkspace || e.shouldIgnore(relPath, false) {
+		return e.unchangedStats(startTime), nil
 	}
 
-	absPath := filepath.Join(e.workspaceRoot, filepath.FromSlash(cleanRel))
-
-	if e.shouldIgnore(cleanRel, false) {
-		return SyncStats{
-			ElapsedMS:   int(time.Since(startTime).Milliseconds()),
-			TotalFiles:  len(e.state.Files),
-			CachedCount: len(e.state.Files),
-			Nodes:       e.db.CountNodesAndEdges(),
-			GitCommit:   e.state.GitCommit,
-		}, nil
-	}
-
-	ext := strings.ToLower(filepath.Ext(cleanRel))
+	ext := strings.ToLower(filepath.Ext(relPath))
 	if _, ok := SupportedExtensions[ext]; !ok {
-		return SyncStats{
-			ElapsedMS:   int(time.Since(startTime).Milliseconds()),
-			TotalFiles:  len(e.state.Files),
-			CachedCount: len(e.state.Files),
-			Nodes:       e.db.CountNodesAndEdges(),
-			GitCommit:   e.state.GitCommit,
-		}, nil
+		return e.unchangedStats(startTime), nil
 	}
 
 	cachedFiles := e.state.Files
@@ -695,46 +832,50 @@ func (e *CacheEngine) SyncTargetFile(relPath string) (SyncStats, error) {
 	isDeleted := os.IsNotExist(statErr)
 
 	var added, modified, deleted []string
+	// Domain the deleted file belonged to, so its module_count can be corrected.
+	deletedDomain := ""
 
 	if isDeleted {
-		if _, exists := cachedFiles[cleanRel]; exists {
-			deleted = append(deleted, cleanRel)
-			e.db.DeleteFileSubnodes(cleanRel)
-			delete(cachedFiles, cleanRel)
+		if info, exists := cachedFiles[relPath]; exists {
+			deleted = append(deleted, relPath)
+			deletedDomain = cacheDomain(relPath, info)
+			e.db.DeleteNodes(info.NodeIDs)
+			delete(cachedFiles, relPath)
 		}
 	} else if statErr == nil {
-		cacheItem, exists := cachedFiles[cleanRel]
+		cacheItem, exists := cachedFiles[relPath]
 		mtime := fi.ModTime().UnixNano()
 		size := fi.Size()
 
 		if !exists {
-			added = append(added, cleanRel)
+			added = append(added, relPath)
 		} else if mtime != cacheItem.Mtime || size != cacheItem.Size {
-			sha := ComputeFileSHA(absPath)
-			if sha != cacheItem.SHA {
-				modified = append(modified, cleanRel)
+			if ComputeFileSHA(absPath) != cacheItem.SHA {
+				modified = append(modified, relPath)
 			}
 		}
 	}
 
 	if len(added) == 0 && len(modified) == 0 && len(deleted) == 0 {
-		return SyncStats{
-			ElapsedMS:   int(time.Since(startTime).Milliseconds()),
-			TotalFiles:  len(cachedFiles),
-			CachedCount: len(cachedFiles),
-			Nodes:       e.db.CountNodesAndEdges(),
-			GitCommit:   e.state.GitCommit,
-		}, nil
+		return e.unchangedStats(startTime), nil
 	}
 
 	// Clean subnodes of modified file before re-parsing
 	for _, rel := range modified {
-		e.db.DeleteFileSubnodes(rel)
+		if info, ok := cachedFiles[rel]; ok {
+			e.db.DeleteNodes(info.NodeIDs)
+		} else {
+			e.db.DeleteFileSubnodes(rel)
+		}
 	}
 
 	for _, rel := range append(added, modified...) {
-		sha := ComputeFileSHA(absPath)
-		parsed := e.parseFile(rel, absPath, sha)
+		data, readErr := os.ReadFile(absPath)
+		if readErr != nil {
+			continue
+		}
+		sha := ComputeFileSHABytes(data)
+		parsed := e.parseFileData(rel, absPath, data, sha)
 		if parsed != nil {
 			domain := GetDomainFromPath(rel)
 			var nodeIDs []string
@@ -758,22 +899,8 @@ func (e *CacheEngine) SyncTargetFile(relPath string) (SyncStats, error) {
 				e.db.CreateEdge(sym.ParentID, sym.ID, string(models.EdgeContains), nil)
 			}
 
-			// L0 Domain
-			domID := "domain:" + domain
-			if _, ok := e.db.GetNode(domID); !ok {
-				l0 := models.L0DomainNode{
-					ID:          domID,
-					Name:        domain,
-					Path:        domain,
-					Description: "Domain " + domain + " containing modules",
-					ModuleCount: 1,
-					Level:       string(models.LevelL0),
-					Labels:      []string{"L0Domain", "Domain"},
-				}
-				e.db.CreateNode(domID, l0.Labels, l0.ToProperties())
-			}
-			e.db.CreateEdge(domID, parsed.FileNode.ID, string(models.EdgeContains), nil)
-
+			// L0 Domain nodes are refreshed after the loop: their module_count
+			// depends on every file in the domain, not just this one.
 			var mtime int64
 			var size int64
 			if fi != nil {
@@ -793,6 +920,35 @@ func (e *CacheEngine) SyncTargetFile(relPath string) (SyncStats, error) {
 		}
 	}
 
+	// Refresh the domains touched by this delta. The count comes from the cache
+	// state, so adding or deleting one file keeps module_count accurate.
+	if len(added) > 0 || len(modified) > 0 || len(deleted) > 0 {
+		domainCounts := make(map[string]int)
+		for rel, info := range cachedFiles {
+			domainCounts[cacheDomain(rel, info)]++
+		}
+		touched := map[string]bool{}
+		for _, rel := range append(added, modified...) {
+			if info, ok := cachedFiles[rel]; ok {
+				touched[cacheDomain(rel, info)] = true
+			}
+		}
+		if deletedDomain != "" {
+			touched[deletedDomain] = true
+		}
+		for dom := range touched {
+			e.upsertDomain(dom, domainCounts[dom])
+		}
+
+		for _, rel := range append(added, modified...) {
+			info, ok := cachedFiles[rel]
+			if !ok {
+				continue
+			}
+			e.db.CreateEdge("domain:"+cacheDomain(rel, info), "file:"+rel, string(models.EdgeContains), nil)
+		}
+	}
+
 	currentFiles := make(map[string]string, len(cachedFiles))
 	for rel := range cachedFiles {
 		currentFiles[rel] = filepath.Join(e.workspaceRoot, filepath.FromSlash(rel))
@@ -803,8 +959,8 @@ func (e *CacheEngine) SyncTargetFile(relPath string) (SyncStats, error) {
 	e.state.GitCommit = e.getGitCommit()
 	e.state.Files = cachedFiles
 	e.state.FullSync = false
+
 	stats := SyncStats{
-		ElapsedMS:     int(time.Since(startTime).Milliseconds()),
 		TotalFiles:    len(cachedFiles),
 		AddedCount:    len(added),
 		ModifiedCount: len(modified),
@@ -813,14 +969,19 @@ func (e *CacheEngine) SyncTargetFile(relPath string) (SyncStats, error) {
 		GitCommit:     e.state.GitCommit,
 	}
 	if err := e.db.Save(); err != nil {
+		stats.ElapsedMS = int(time.Since(startTime).Milliseconds())
 		stats.Error = fmt.Sprintf("save graph database: %v", err)
 		return stats, fmt.Errorf("save graph database: %w", err)
 	}
 	if err := e.saveCacheState(); err != nil {
+		stats.ElapsedMS = int(time.Since(startTime).Milliseconds())
 		stats.Error = fmt.Sprintf("save cache state: %v", err)
 		return stats, fmt.Errorf("save cache state: %w", err)
 	}
 	stats.Nodes = e.db.CountNodesAndEdges()
+	// Measured after persistence: the hook reports this value, so it must cover
+	// the save as well instead of only the in-memory work.
+	stats.ElapsedMS = int(time.Since(startTime).Milliseconds())
 	return stats, nil
 }
 
@@ -881,10 +1042,10 @@ func (e *CacheEngine) resolveDeltaEdges(added, modified, deleted []string, curre
 		dirtySet[rel] = true
 	}
 
-	for id, props := range e.db.AllNodes() {
+	e.db.RangeNodes(func(id string, props map[string]any) {
 		lvl, _ := props["level"].(string)
 		if lvl != string(models.LevelL3) {
-			continue
+			return
 		}
 		fPath, _ := props["file_path"].(string)
 		isDirtyFile := dirtySet[fPath]
@@ -908,7 +1069,7 @@ func (e *CacheEngine) resolveDeltaEdges(added, modified, deleted []string, curre
 				})
 			}
 		}
-	}
+	})
 
 	if len(deltaCallSpecs) > 0 {
 		e.resolveCallEdges(deltaCallSpecs)
@@ -917,28 +1078,28 @@ func (e *CacheEngine) resolveDeltaEdges(added, modified, deleted []string, curre
 
 func (e *CacheEngine) resolveAllCallEdges() {
 	var allCallSpecs []CallSpec
-	for id, props := range e.db.AllNodes() {
-		lvl, _ := props["level"].(string)
-		if lvl == string(models.LevelL3) {
-			if callsRaw, ok := props["calls"].([]string); ok {
-				for _, c := range callsRaw {
+	e.db.RangeNodes(func(id string, props map[string]any) {
+		if lvl, _ := props["level"].(string); lvl != string(models.LevelL3) {
+			return
+		}
+		if callsRaw, ok := props["calls"].([]string); ok {
+			for _, c := range callsRaw {
+				allCallSpecs = append(allCallSpecs, CallSpec{
+					CallerID:   id,
+					CalledName: c,
+				})
+			}
+		} else if callsAny, ok := props["calls"].([]any); ok {
+			for _, c := range callsAny {
+				if cStr, ok := c.(string); ok {
 					allCallSpecs = append(allCallSpecs, CallSpec{
 						CallerID:   id,
-						CalledName: c,
+						CalledName: cStr,
 					})
-				}
-			} else if callsAny, ok := props["calls"].([]any); ok {
-				for _, c := range callsAny {
-					if cStr, ok := c.(string); ok {
-						allCallSpecs = append(allCallSpecs, CallSpec{
-							CallerID:   id,
-							CalledName: cStr,
-						})
-					}
 				}
 			}
 		}
-	}
+	})
 	e.resolveCallEdges(allCallSpecs)
 }
 
@@ -966,7 +1127,7 @@ func (e *CacheEngine) resolveImportEdges(imports []ImportSpec, currentFiles map[
 	}
 	edges := make(map[edgeKey]map[string]any)
 
-	allGoModules := e.readAllGoModules()
+	allGoModules := e.readAllGoModules(currentFiles)
 	if len(allGoModules) == 0 {
 		rootMod := e.readGoModulePath()
 		if rootMod != "" {
@@ -1145,21 +1306,28 @@ func (e *CacheEngine) resolveImportEdges(imports []ImportSpec, currentFiles map[
 }
 
 func (e *CacheEngine) resolveCallEdges(calls []CallSpec) {
-	allNodes := e.db.AllNodes()
-
-	// Group L3 symbols by their short name (e.g. AuthService.login -> login, or login -> login)
-	byName := make(map[string][]string)
-	for id, props := range allNodes {
-		lvl, _ := props["level"].(string)
-		if lvl == string(models.LevelL3) {
-			fullName, _ := props["name"].(string)
-			shortName := fullName
-			if idx := strings.LastIndex(fullName, "."); idx != -1 {
-				shortName = fullName[idx+1:]
-			}
-			byName[shortName] = append(byName[shortName], id)
-		}
+	// Group L3 symbols by their short name (e.g. AuthService.login -> login, or
+	// login -> login). Only the two properties the resolver needs are kept, so
+	// the graph does not have to hand out a copy of every node's property map.
+	type symbolMeta struct {
+		filePath string
+		name     string
 	}
+	byName := make(map[string][]string)
+	meta := make(map[string]symbolMeta)
+	e.db.RangeNodes(func(id string, props map[string]any) {
+		if lvl, _ := props["level"].(string); lvl != string(models.LevelL3) {
+			return
+		}
+		fullName, _ := props["name"].(string)
+		shortName := fullName
+		if idx := strings.LastIndex(fullName, "."); idx != -1 {
+			shortName = fullName[idx+1:]
+		}
+		byName[shortName] = append(byName[shortName], id)
+		fPath, _ := props["file_path"].(string)
+		meta[id] = symbolMeta{filePath: fPath, name: fullName}
+	})
 
 	importedMap := make(map[string]map[string]bool)
 	getImportedFiles := func(filePath string) map[string]bool {
@@ -1188,7 +1356,7 @@ func (e *CacheEngine) resolveCallEdges(calls []CallSpec) {
 			continue
 		}
 
-		callerProps, exists := allNodes[call.CallerID]
+		caller, exists := meta[call.CallerID]
 		if !exists {
 			continue
 		}
@@ -1203,8 +1371,8 @@ func (e *CacheEngine) resolveCallEdges(calls []CallSpec) {
 			continue
 		}
 
-		callerFile, _ := callerProps["file_path"].(string)
-		callerFullName, _ := callerProps["name"].(string)
+		callerFile := caller.filePath
+		callerFullName := caller.name
 		callerClass := ""
 		if idx := strings.LastIndex(callerFullName, "."); idx != -1 {
 			callerClass = callerFullName[:idx]
@@ -1213,7 +1381,7 @@ func (e *CacheEngine) resolveCallEdges(calls []CallSpec) {
 		// 1. Same file candidates
 		var sameFile []string
 		for _, c := range filteredCandidates {
-			if cProps, ok := allNodes[c]; ok && cProps["file_path"] == callerFile {
+			if cm, ok := meta[c]; ok && cm.filePath == callerFile {
 				sameFile = append(sameFile, c)
 			}
 		}
@@ -1224,9 +1392,8 @@ func (e *CacheEngine) resolveCallEdges(calls []CallSpec) {
 			var sameClass []string
 			if callerClass != "" {
 				for _, c := range sameFile {
-					if cProps, ok := allNodes[c]; ok {
-						cName, _ := cProps["name"].(string)
-						if idx := strings.LastIndex(cName, "."); idx != -1 && cName[:idx] == callerClass {
+					if cm, ok := meta[c]; ok {
+						if idx := strings.LastIndex(cm.name, "."); idx != -1 && cm.name[:idx] == callerClass {
 							sameClass = append(sameClass, c)
 						}
 					}
@@ -1242,11 +1409,8 @@ func (e *CacheEngine) resolveCallEdges(calls []CallSpec) {
 			importedFiles := getImportedFiles(callerFile)
 			var viaImport []string
 			for _, c := range filteredCandidates {
-				if cProps, ok := allNodes[c]; ok {
-					cFile, _ := cProps["file_path"].(string)
-					if importedFiles[cFile] {
-						viaImport = append(viaImport, c)
-					}
+				if cm, ok := meta[c]; ok && importedFiles[cm.filePath] {
+					viaImport = append(viaImport, c)
 				}
 			}
 			if len(viaImport) == 1 {
@@ -1268,66 +1432,74 @@ func (e *CacheEngine) resolveCallEdges(calls []CallSpec) {
 
 // readGoModulePath returns the module path declared in <workspace>/go.mod, or "".
 func (e *CacheEngine) readGoModulePath() string {
-	data, err := os.ReadFile(filepath.Join(e.workspaceRoot, "go.mod"))
+	return e.readGoModuleInDir(".")
+}
+
+// readAllGoModules maps modulePath -> relativeDir for every module that can be
+// an import target. Instead of walking the whole workspace it only inspects the
+// directories that hold Go files (and their ancestors): that is a much smaller
+// set and exactly the set an import can resolve to.
+func (e *CacheEngine) readAllGoModules(currentFiles map[string]string) map[string]string {
+	dirs := make(map[string]bool)
+	for rel := range currentFiles {
+		if !strings.HasSuffix(rel, ".go") {
+			continue
+		}
+		for dir := path.Dir(rel); ; dir = path.Dir(dir) {
+			dirs[dir] = true
+			if dir == "." || dir == "/" || dir == "" {
+				break
+			}
+		}
+	}
+
+	modules := make(map[string]string)
+	for dir := range dirs {
+		modPath := e.readGoModuleInDir(dir)
+		if modPath == "" {
+			continue
+		}
+		relDir := dir
+		if relDir == "." {
+			relDir = ""
+		}
+		modules[modPath] = relDir
+	}
+	return modules
+}
+
+// readGoModuleInDir returns the module path declared in <dir>/go.mod, or "".
+func (e *CacheEngine) readGoModuleInDir(dir string) string {
+	data, err := os.ReadFile(filepath.Join(e.workspaceRoot, filepath.FromSlash(dir), "go.mod"))
 	if err != nil {
 		return ""
 	}
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "module") {
-			rest := strings.TrimSpace(strings.TrimPrefix(line, "module"))
-			if i := strings.Index(rest, "//"); i >= 0 {
-				rest = strings.TrimSpace(rest[:i])
-			}
-			return strings.Trim(rest, `"`)
+		if !strings.HasPrefix(line, "module") {
+			continue
 		}
+		rest := strings.TrimSpace(strings.TrimPrefix(line, "module"))
+		if i := strings.Index(rest, "//"); i >= 0 {
+			rest = strings.TrimSpace(rest[:i])
+		}
+		return strings.Trim(rest, `"`)
 	}
 	return ""
 }
 
-// readAllGoModules discovers all go.mod files across monorepos and maps modulePath -> relativeDir
-func (e *CacheEngine) readAllGoModules() map[string]string {
-	modules := make(map[string]string)
-	_ = filepath.Walk(e.workspaceRoot, func(p string, info os.FileInfo, err error) error {
-		if err != nil || info == nil {
-			return nil
-		}
-		if info.IsDir() {
-			base := info.Name()
-			if strings.HasPrefix(base, ".") || base == "node_modules" || base == "vendor" || base == "dist" {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if info.Name() == "go.mod" {
-			data, err := os.ReadFile(p)
-			if err == nil {
-				for _, line := range strings.Split(string(data), "\n") {
-					line = strings.TrimSpace(line)
-					if strings.HasPrefix(line, "module") {
-						rest := strings.TrimSpace(strings.TrimPrefix(line, "module"))
-						if i := strings.Index(rest, "//"); i >= 0 {
-							rest = strings.TrimSpace(rest[:i])
-						}
-						modPath := strings.Trim(rest, `"`)
-						relDir, _ := filepath.Rel(e.workspaceRoot, filepath.Dir(p))
-						relDir = filepath.ToSlash(relDir)
-						if relDir == "." {
-							relDir = ""
-						}
-						modules[modPath] = relDir
-						break
-					}
-				}
-			}
-		}
-		return nil
-	})
-	return modules
-}
-
 // readTSConfigPaths loads compilerOptions.paths from tsconfig.json or jsconfig.json if present
 func (e *CacheEngine) readTSConfigPaths() map[string]string {
+	fingerprint := ""
+	for _, configFile := range []string{"tsconfig.json", "jsconfig.json"} {
+		if fi, err := os.Stat(filepath.Join(e.workspaceRoot, configFile)); err == nil {
+			fingerprint += fmt.Sprintf("%s:%d:%d;", configFile, fi.ModTime().UnixNano(), fi.Size())
+		}
+	}
+	if e.tsPathsCache != nil && fingerprint == e.tsPathsStamp {
+		return e.tsPathsCache
+	}
+
 	paths := make(map[string]string)
 	for _, configFile := range []string{"tsconfig.json", "jsconfig.json"} {
 		p := filepath.Join(e.workspaceRoot, configFile)
@@ -1351,6 +1523,8 @@ func (e *CacheEngine) readTSConfigPaths() map[string]string {
 			break
 		}
 	}
+	e.tsPathsCache = paths
+	e.tsPathsStamp = fingerprint
 	return paths
 }
 
