@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -41,12 +42,61 @@ func TestSyncCompletesTargetedUpdateAfterWorkspaceDrift(t *testing.T) {
 
 	stats := engine.Sync(false)
 	if stats.Error != "" {
-		t.Fatalf("follow-up full sync failed: %s", stats.Error)
+		t.Fatalf("follow-up sync failed: %s", stats.Error)
 	}
 	if !engine.IsFullyIndexed() {
 		t.Fatal("follow-up sync should restore the full-index marker")
 	}
 	if _, ok := db.GetNode("file:c.py"); !ok {
-		t.Fatal("follow-up full sync did not index the unedited file")
+		t.Fatal("follow-up sync did not index the unedited file")
+	}
+	// The follow-up must stay incremental: only the new file is parsed, the
+	// file already refreshed by the targeted sync is a cache hit.
+	if stats.AddedCount != 1 || stats.ModifiedCount != 0 || stats.CachedCount != 2 {
+		t.Fatalf("follow-up sync was not incremental: added=%d modified=%d cached=%d",
+			stats.AddedCount, stats.ModifiedCount, stats.CachedCount)
+	}
+}
+
+func TestRefreshStateSeesExternalCacheUpdate(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.py"), []byte("def first():\n    return 1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.NewLatticeConfig(root)
+	engine := NewCacheEngine(cfg, storage.NewGraphStorage(cfg.DBPath))
+	if stats := engine.Sync(false); stats.Error != "" {
+		t.Fatalf("initial sync failed: %s", stats.Error)
+	}
+	if engine.RefreshState() {
+		t.Fatal("no external write happened yet, RefreshState should be a no-op")
+	}
+
+	// Simulate the post-tool hook running in another process: it rewrites the
+	// cache state with FullSync=false and a new mtime/size.
+	data, err := os.ReadFile(cfg.CacheStateFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	raw["full_sync"] = false
+	raw["last_sync"] = float64(1)
+	updated, err := json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfg.CacheStateFile, updated, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if !engine.RefreshState() {
+		t.Fatal("RefreshState did not detect the externally written state")
+	}
+	if engine.IsFullyIndexed() {
+		t.Fatal("RefreshState kept the stale full-index marker")
 	}
 }

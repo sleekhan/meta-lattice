@@ -83,11 +83,20 @@ type SyncStats struct {
 	Error         string         `json:"error,omitempty"`
 }
 
+// stateSignature identifies the on-disk cache state file so a long-running
+// process (e.g. the MCP server) can notice that another process such as the
+// post-tool hook rewrote it.
+type stateSignature struct {
+	modTime time.Time
+	size    int64
+}
+
 type CacheEngine struct {
 	config        *config.LatticeConfig
 	db            *storage.GraphStorage
 	workspaceRoot string
 	state         CacheState
+	stateSig      stateSignature
 	mu            sync.Mutex
 }
 
@@ -109,6 +118,25 @@ func (e *CacheEngine) IsFullyIndexed() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.state.FullSync
+}
+
+// RefreshState reloads the persisted cache state when the state file changed
+// since it was last read or written by this engine. It reports whether a
+// reload happened. Long-running processes must call this before deciding
+// whether to sync, otherwise a targeted update performed by another process
+// (the post-tool hook) is invisible to them.
+func (e *CacheEngine) RefreshState() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	fi, err := os.Stat(e.config.CacheStateFile)
+	if err != nil {
+		return false
+	}
+	if fi.ModTime().Equal(e.stateSig.modTime) && fi.Size() == e.stateSig.size {
+		return false
+	}
+	e.loadCacheState()
+	return true
 }
 
 func (e *CacheEngine) loadCacheState() {
@@ -139,6 +167,9 @@ func (e *CacheEngine) loadCacheState() {
 	}
 
 	e.state = loaded
+	if fi, statErr := os.Stat(e.config.CacheStateFile); statErr == nil {
+		e.stateSig = stateSignature{modTime: fi.ModTime(), size: fi.Size()}
+	}
 }
 
 func (e *CacheEngine) saveCacheState() error {
@@ -153,7 +184,14 @@ func (e *CacheEngine) saveCacheState() error {
 	if err := os.WriteFile(tmpFile, data, 0644); err != nil {
 		return err
 	}
-	return os.Rename(tmpFile, e.config.CacheStateFile)
+	if err := os.Rename(tmpFile, e.config.CacheStateFile); err != nil {
+		return err
+	}
+	// Remember our own write so RefreshState does not reload it needlessly.
+	if fi, err := os.Stat(e.config.CacheStateFile); err == nil {
+		e.stateSig = stateSignature{modTime: fi.ModTime(), size: fi.Size()}
+	}
+	return nil
 }
 
 func ComputeFileSHA(filePath string) string {
@@ -307,8 +345,11 @@ func (e *CacheEngine) Sync(force bool) SyncStats {
 		cachedFiles = make(map[string]CacheFileInfo)
 	}
 
-	// Rebuild after a targeted partial update or loss of the persisted graph.
-	if !force && (!e.state.FullSync || (len(cachedFiles) > 0 && e.db.CountNodesAndEdges()["total_nodes"] == 0)) {
+	// Rebuild only when the persisted graph was lost while the cache still
+	// claims indexed files. A targeted partial update (FullSync=false) must NOT
+	// force a full re-parse: the delta scan below already detects workspace
+	// drift, so re-parsing every file would only burn CPU.
+	if !force && len(cachedFiles) > 0 && e.db.CountNodesAndEdges()["total_nodes"] == 0 {
 		force = true
 	}
 
@@ -464,12 +505,10 @@ func (e *CacheEngine) Sync(force bool) SyncStats {
 	parseWg.Wait()
 	close(parseResults)
 
-	domainsSeen := make(map[string]bool)
 	for pr := range parseResults {
 		if pr.res != nil {
 			res := pr.res
 			domain := GetDomainFromPath(pr.rel)
-			domainsSeen[domain] = true
 
 			var nodeIDs []string
 
@@ -508,14 +547,6 @@ func (e *CacheEngine) Sync(force bool) SyncStats {
 	}
 
 	// Step 3: Ensure L0 Domain nodes
-	for rel, info := range cachedFiles {
-		d := info.Domain
-		if d == "" {
-			d = GetDomainFromPath(rel)
-		}
-		domainsSeen[d] = true
-	}
-
 	domainCounts := make(map[string]int)
 	for rel, info := range cachedFiles {
 		d := info.Domain
@@ -580,14 +611,19 @@ func (e *CacheEngine) Sync(force bool) SyncStats {
 		}
 	}
 
-	// Persist graph before cache metadata; a partial update must not be marked complete.
-	if len(added) > 0 || len(modified) > 0 || len(deleted) > 0 || force || e.db.IsDirty() || !e.state.FullSync {
+	// Persist the graph only when it actually changed; the cache state may still
+	// need to be written to restore the full-index marker after a targeted
+	// update, without rewriting the whole graph file.
+	graphChanged := len(added) > 0 || len(modified) > 0 || len(deleted) > 0 || force || e.db.IsDirty()
+	if graphChanged || !e.state.FullSync {
 		e.state.LastSync = time.Now().Unix()
 		e.state.GitCommit = e.getGitCommit()
 		e.state.Files = cachedFiles
-		if err := e.db.Save(); err != nil {
-			e.state.FullSync = false
-			return SyncStats{ElapsedMS: int(time.Since(startTime).Milliseconds()), Error: fmt.Sprintf("save graph database: %v", err)}
+		if graphChanged {
+			if err := e.db.Save(); err != nil {
+				e.state.FullSync = false
+				return SyncStats{ElapsedMS: int(time.Since(startTime).Milliseconds()), Error: fmt.Sprintf("save graph database: %v", err)}
+			}
 		}
 		e.state.FullSync = true
 		if err := e.saveCacheState(); err != nil {
@@ -767,23 +803,25 @@ func (e *CacheEngine) SyncTargetFile(relPath string) (SyncStats, error) {
 	e.state.GitCommit = e.getGitCommit()
 	e.state.Files = cachedFiles
 	e.state.FullSync = false
-	if err := e.db.Save(); err != nil {
-		return SyncStats{}, fmt.Errorf("save graph database: %w", err)
-	}
-	if err := e.saveCacheState(); err != nil {
-		return SyncStats{}, fmt.Errorf("save cache state: %w", err)
-	}
-
-	return SyncStats{
+	stats := SyncStats{
 		ElapsedMS:     int(time.Since(startTime).Milliseconds()),
 		TotalFiles:    len(cachedFiles),
 		AddedCount:    len(added),
 		ModifiedCount: len(modified),
 		DeletedCount:  len(deleted),
 		CachedCount:   len(cachedFiles) - len(added) - len(modified),
-		Nodes:         e.db.CountNodesAndEdges(),
 		GitCommit:     e.state.GitCommit,
-	}, nil
+	}
+	if err := e.db.Save(); err != nil {
+		stats.Error = fmt.Sprintf("save graph database: %v", err)
+		return stats, fmt.Errorf("save graph database: %w", err)
+	}
+	if err := e.saveCacheState(); err != nil {
+		stats.Error = fmt.Sprintf("save cache state: %v", err)
+		return stats, fmt.Errorf("save cache state: %w", err)
+	}
+	stats.Nodes = e.db.CountNodesAndEdges()
+	return stats, nil
 }
 
 func (e *CacheEngine) resolveDeltaEdges(added, modified, deleted []string, currentFiles map[string]string, cachedFiles map[string]CacheFileInfo) {
