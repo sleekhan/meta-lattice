@@ -123,32 +123,50 @@ func ensureIdentityIndexes(db *latticedb.DB) error {
 }
 
 // nodeResolver maps stable string ids to LatticeDB node ids inside one
-// transaction. It remembers both directions so edge prefetching and repeated
-// lookups stay cheap.
+// transaction. It remembers resolved and missing ids so repeated lookups stay
+// cheap without copying the whole in-memory node table up front.
 type nodeResolver struct {
-	tx        *latticedb.Tx
-	labelByID map[string]string
-	resolved  map[string]latticedb.NodeID
-	missing   map[string]bool
+	tx       *latticedb.Tx
+	journal  *graphJournal
+	nodes    map[string]*NodeData
+	resolved map[string]latticedb.NodeID
+	missing  map[string]bool
 }
 
 func newNodeResolver(tx *latticedb.Tx, journal *graphJournal, nodes map[string]*NodeData) *nodeResolver {
-	labelByID := make(map[string]string, len(nodes)+len(journal.nodes))
-	for id, node := range nodes {
-		if label := identityLabel(node.Labels); label != "" {
-			labelByID[id] = label
-		}
-	}
-	for id, mutation := range journal.nodes {
-		if label := identityLabel(mutation.labels); label != "" {
-			labelByID[id] = label
-		}
-	}
 	return &nodeResolver{
-		tx:        tx,
-		labelByID: labelByID,
-		resolved:  make(map[string]latticedb.NodeID),
-		missing:   make(map[string]bool),
+		tx:       tx,
+		journal:  journal,
+		nodes:    nodes,
+		resolved: make(map[string]latticedb.NodeID),
+		missing:  make(map[string]bool),
+	}
+}
+
+func (r *nodeResolver) labelFor(id string) string {
+	if node, ok := r.nodes[id]; ok {
+		if label := identityLabel(node.Labels); label != "" {
+			return label
+		}
+	}
+	if r.journal != nil {
+		if mutation, ok := r.journal.nodes[id]; ok {
+			if label := identityLabel(mutation.labels); label != "" {
+				return label
+			}
+		}
+	}
+	switch {
+	case strings.HasPrefix(id, "domain:"):
+		return "L0Domain"
+	case strings.HasPrefix(id, "file:"):
+		return "L1Module"
+	case strings.HasPrefix(id, "class:"):
+		return "L2Class"
+	case strings.HasPrefix(id, "symbol:"):
+		return "L3Symbol"
+	default:
+		return ""
 	}
 }
 
@@ -162,8 +180,8 @@ func (r *nodeResolver) resolve(id string) (latticedb.NodeID, bool, error) {
 		return 0, false, nil
 	}
 
-	label, ok := r.labelByID[id]
-	if !ok {
+	label := r.labelFor(id)
+	if label == "" {
 		r.missing[id] = true
 		return 0, false, nil
 	}
@@ -642,6 +660,8 @@ func loadFromLatticeDB(latticePath string) (map[string]*NodeData, map[string][]m
 		props, ok := row["props"].(map[string]any)
 		if !ok || props == nil {
 			props = make(map[string]any)
+		} else {
+			normalizeNodeProperties(props)
 		}
 
 		edge := models.GraphEdge{
