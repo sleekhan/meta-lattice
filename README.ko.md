@@ -34,6 +34,7 @@
 ## 🏛 주요 특징 (Key Advantages)
 
 - **공식 LatticeDB 단일 파일 그래프 데이터베이스 탑재 (v2 압축 스키마 + 온디맨드 지연 조회 엔진)**: 공식 `github.com/jeffhajewski/latticedb/bindings/go`를 통해 `.lattice/knowledge.lattice` 단일 바이너리 파일로 L0~L3 지식 그래프 및 엣지 관계를 관리합니다. 전체 속성을 `_p` JSON 페이로드로 압축하고 핵심 B-Tree 인덱스(`(label, id)`, `(L1Module, path)`, `(L2Class, name)`, `(L3Symbol, name/short_name)`) 및 네이티브 BM25 FTS 인덱스(`search_text`)를 구성하여, 3,000개 파일 규모에서도 전체 그래프를 메모리에 적재하지 않고 27~147ms 내에 즉시 조회·동기화합니다.
+- **크로스 플랫폼 무결성 및 윈도우 환경 완벽 지원**: macOS, Linux뿐만 아니라 Windows 환경에서도 완벽히 구동됩니다. 윈도우 파일 시스템 특유의 핸들 잠금 충돌(`ERROR_SHARING_VIOLATION`)을 방지하기 위해 읽기 핸들을 동기적으로 즉시 반환하며, 역슬래시(`\`)와 드라이브 경로(`C:\...`)를 내부 표준 경로로 자동 정규화하고 `install.ps1`을 통한 무설치 순수 Go 빌드를 지원합니다.
 - **배포 아티팩트 내 네이티브 라이브러리 자동 번들링**: 릴리스 아카이브 내에 `liblattice` 동적 라이브러리와 RPATH(`@executable_path`, `$ORIGIN`)가 사전 구성되어 별도의 시스템 라이브러리 설치 없이 즉시 구동됩니다.
 - **대규모 프로젝트 최적화 멀티코어 병렬 파싱**: `runtime.GOMAXPROCS(0)` 기반 워커 풀(Worker Pool)을 적용하여 수천~수만 개의 대규모 프로젝트 파일도 CPU 코어 수에 맞추어 초고속 병렬 파싱합니다.
 - **엔터프라이즈 멀티 랭귀지 AST 파서 내장**: **Go**(`go/ast`, `go/parser`), **Python**, **TypeScript/JavaScript**, **Java**, **Kotlin**(`.kt`, `.kts`), **C#**(`.cs`), **Swift**(`.swift`), **PHP**(`.php`), **Rust**(`.rs`), **C/C++**(`.c`, `.cpp`, `.cc`, `.cxx`, `.h`, `.hpp`) 소스 코드를 네이티브 파싱하여 심볼, 시그니처, 클래스, 호출 그래프를 추출합니다. 프론트엔드 지원: **Vue SFC**(`.vue`), **Svelte**(`.svelte`), **React JSX/TSX**(JSX 사용 엣지, PascalCase 컴포넌트 판별), **Angular**(`@Component` 데코레이터 인식).
@@ -64,7 +65,7 @@
 * **결과 브리핑**: 0~100 점수의 **Blast Score**, 4단계 리스크 티어(`CRITICAL`, `HIGH`, `MODERATE`, `LOW`), Top 10 파괴적 변경 지점 및 ASCII 영향 전파 트리 출력.
 
 ### 4. 증분 AST 인덱서 & 로컬 캐시 엔진 (Incremental AST Cache)
-* **SHA-256 & Mtime 매핑**: 파일 SHA-256 해시와 mtime을 캐시 상태(`.lattice/cache_state.json`, v1.4)에 기록. 캐시 버전이 다르면 다음 sync에서 자동으로 전체 재인덱싱합니다.
+* **SHA-256 & Mtime 매핑**: 파일 SHA-256 해시, mtime, 심볼 요약 정보를 캐시 상태(`.lattice/cache_state.json`, v1.5)에 기록. 캐시 버전이 다르면 다음 sync에서 자동으로 전체 재인덱싱합니다.
 * **국소적 델타 엣지 갱신 (Localized Delta Invalidation)**: 파일이 수정되었을 때 전체 그래프를 지우지 않고 변경된 파일과 직접 관련된 의존 엣지만 $O(\Delta)$로 선별 삭제 후 갱신하여 수만 개 파일 환경에서도 밀리초 단위 재동기화를 달성합니다.
 * **증분 영속화 및 온디맨드 네이티브 조회 (Incremental Persistence & Lazy Native Queries)**: 마지막 저장 이후 변경된 노드/엣지의 최종 상태만 저널에 기록해 두었다가 `.lattice` 파일에 단일 트랜잭션으로 재생하며, 조회 및 단일 파일 훅 동기화 시 전체 그래프를 메모리에 로드하지 않고 LatticeDB의 B-Tree·인접 리스트·FTS 인덱스를 직접 조회합니다(3,000파일 그래프 기준 콜드 `zoom_symbol`/`zoom_module`/`blast` 약 27ms, 단일 파일 훅 sync 약 147ms). 최초/강제 sync는 기존처럼 파일을 전체 재작성하며, 락 충돌이나 인덱스 미지원 파일은 안전하게 전체 재작성으로 폴백합니다.
 * **상호 파일 의존성 자동 복원**: 파일 간 `IMPORTS` 엣지와 L3 심볼 간 최적 스코프(동일 클래스 우선, 동일 파일 우선, import된 파일 우선) `CALLS` 엣지를 자동 연결.
@@ -403,9 +404,14 @@ Google Antigravity(IDE 및 CLI) 환경에서는 MCP 서버 연동과 더불어 *
 # 7. 플랫폼 설치 상태 확인
 ./meta-lattice install --status
 
-# 기계 판독 출력이 필요하면 --json (sync, status, zoom, audit, blast, scaffold, apply-plan)
+# 8. 자동 IDE/에이전트 훅 (세션 시작 및 도구 실행 후 자동 동기화/감사)
+./meta-lattice hook session-start
+./meta-lattice hook post-tool --file src/indexer/go_parser.go
+
+# 기계 판독 출력이 필요하면 --json (sync, status, zoom, audit, blast, scaffold, apply-plan, hook)
 ./meta-lattice zoom search BlastRadius --json
 ./meta-lattice audit --json
+./meta-lattice hook post-tool --file src/indexer/go_parser.go --json
 ```
 
 ---

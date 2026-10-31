@@ -34,6 +34,7 @@ It ships official [LatticeDB](https://github.com/jeffhajewski/latticedb) v0.15.0
 ## 🏛 Key Advantages
 
 - **Official LatticeDB single-file graph database (v2 packed + lazy on-demand engine)**: manages the L0–L3 knowledge graph and edge relations in a single binary file `.lattice/knowledge.lattice` via the official `github.com/jeffhajewski/latticedb/bindings/go`. Uses a packed v2 property schema (`_p` JSON payload + B-Tree indexes on `(label, id)`, `(L1Module, path)`, `(L2Class, name)`, `(L3Symbol, name/short_name)` + native BM25 FTS on `search_text`) so cold queries (`zoom_*`, `blast`, `audit`, `status`, hook edits) execute directly against LatticeDB in 27–147 ms on 3,000-file graphs without hydrating the full graph into memory.
+- **Cross-platform reliability & Windows-first hardening**: seamless support across macOS, Linux, and Windows. Windows environments feature synchronous handle reclamation to eliminate `ERROR_SHARING_VIOLATION` file-locking pitfalls during atomic renames, full normalization of Windows backslash and drive paths (`C:\...`, `.\path\to\file`), and zero-dependency pure-Go fallback compilation via `install.ps1`.
 - **Native libraries auto-bundled in release artifacts**: release archives ship the `liblattice` shared library with preconfigured RPATH (`@executable_path`, `$ORIGIN`), so no system library installation is needed.
 - **Multi-core parallel parsing optimized for large projects**: a `runtime.GOMAXPROCS(0)`-based worker pool parses thousands to tens of thousands of files at full CPU speed.
 - **Built-in enterprise multi-language AST parsers**: natively parses **Go** (`go/ast`, `go/parser`), **Python**, **TypeScript/JavaScript**, **Java**, **Kotlin** (`.kt`, `.kts`), **C#** (`.cs`), **Swift** (`.swift`), **PHP** (`.php`), **Rust** (`.rs`), and **C/C++** (`.c`, `.cpp`, `.cc`, `.cxx`, `.h`, `.hpp`) to extract symbols, signatures, classes, and call graphs. Frontend support: **Vue SFC** (`.vue`), **Svelte** (`.svelte`), **React JSX/TSX** (JSX usage edges, PascalCase component detection), **Angular** (`@Component` decorator recognition).
@@ -64,7 +65,7 @@ It ships official [LatticeDB](https://github.com/jeffhajewski/latticedb) v0.15.0
 * **Result briefing**: 0–100 **Blast Score**, 4 risk tiers (`CRITICAL`, `HIGH`, `MODERATE`, `LOW`), Top 10 breaking points, and an ASCII impact-propagation tree.
 
 ### 4. Incremental AST Indexer & Local Cache Engine
-* **SHA-256 & mtime mapping**: file hashes and mtimes are recorded in cache state (`.lattice/cache_state.json`, v1.4). A version mismatch triggers automatic full re-indexing on the next sync.
+* **SHA-256 & mtime mapping**: file hashes, mtimes, and symbol digests are recorded in cache state (`.lattice/cache_state.json`, v1.5). A version mismatch triggers automatic full re-indexing on the next sync.
 * **Localized delta edge updates**: on file modification only the directly related dependency edges are selectively deleted and rebuilt in $O(\Delta)$ — no full-graph wipe — achieving millisecond re-syncs on tens of thousands of files.
 * **Incremental persistence & lazy native queries**: only the nodes and edges touched since the last save are replayed into `knowledge.lattice` in a single transaction, and read/hook operations query LatticeDB's B-Tree, adjacency, and FTS indexes on demand without eager full-graph loading (~27 ms cold `zoom_symbol`/`zoom_module`/`blast`, ~147 ms single-file hook sync on 3,000 files). Initial or forced syncs still rebuild the file, and a lock conflict or an unindexed legacy file falls back safely instead of corrupting the graph.
 * **Automatic cross-file dependency restoration**: `IMPORTS` edges between files and optimally-scoped (same class first, same file first, imported files first) `CALLS` edges between L3 symbols.
@@ -403,9 +404,14 @@ Register in the project root's [`.agents/mcp_config.json`](file:///.agents/mcp_c
 # 7. Check platform install status
 ./meta-lattice install --status
 
-# Machine-readable output with --json (sync, status, zoom, audit, blast, scaffold, apply-plan)
+# 8. Automated IDE/Agent Hooks (session-start / post-tool file sync & audit)
+./meta-lattice hook session-start
+./meta-lattice hook post-tool --file src/indexer/go_parser.go
+
+# Machine-readable output with --json (sync, status, zoom, audit, blast, scaffold, apply-plan, hook)
 ./meta-lattice zoom search BlastRadius --json
 ./meta-lattice audit --json
+./meta-lattice hook post-tool --file src/indexer/go_parser.go --json
 ```
 
 ---
