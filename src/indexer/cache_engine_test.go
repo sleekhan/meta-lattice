@@ -211,6 +211,92 @@ func TestSyncWithoutChangesDoesNotRewriteGraph(t *testing.T) {
 	}
 }
 
+func TestSyncRebuildsWhenGraphCountsDrift(t *testing.T) {
+	root := t.TempDir()
+	for _, name := range []string{"a.py", "b.py"} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte("def fn():\n    return 1\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cfg := config.NewLatticeConfig(root)
+	db := storage.NewGraphStorage(cfg.DBPath)
+	engine := NewCacheEngine(cfg, db)
+	if stats := engine.Sync(false); stats.Error != "" {
+		t.Fatalf("initial sync failed: %s", stats.Error)
+	}
+	if engine.state.GraphNodes == 0 || engine.state.GraphEdges == 0 {
+		t.Fatalf("sync did not record the graph size: %+v", engine.state)
+	}
+
+	// Simulate a graph that no longer matches the cache state (for example a
+	// save that was interrupted): a delta would be applied to the wrong base.
+	db.DeleteNode("file:b.py")
+
+	stats := engine.Sync(false)
+	if stats.Error != "" {
+		t.Fatalf("drift sync failed: %s", stats.Error)
+	}
+	if stats.AddedCount != 2 {
+		t.Fatalf("drift should force a full re-parse, got %+v", stats)
+	}
+	if _, ok := db.GetNode("file:b.py"); !ok {
+		t.Fatal("the drifted graph was not rebuilt")
+	}
+
+	// Once rebuilt the counts match again, so the next sync stays cheap.
+	again := engine.Sync(false)
+	if again.AddedCount != 0 || again.ModifiedCount != 0 {
+		t.Fatalf("sync after recovery was not incremental: %+v", again)
+	}
+}
+
+func TestSyncRecoversAfterGraphFileLoss(t *testing.T) {
+	root := t.TempDir()
+	for _, name := range []string{"a.py", "b.py"} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte("def fn():\n    return 1\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cfg := config.NewLatticeConfig(root)
+	db := storage.NewGraphStorage(cfg.DBPath)
+	engine := NewCacheEngine(cfg, db)
+	if stats := engine.Sync(false); stats.Error != "" {
+		t.Fatalf("initial sync failed: %s", stats.Error)
+	}
+
+	// The graph file disappears while the cache state survives (deleted
+	// .lattice directory, failed rename, ...). A targeted sync then rebuilds a
+	// partial graph from one file; the next full sync must notice that the
+	// graph is missing a module instead of trusting the recorded counts.
+	if err := os.Remove(db.DatabasePath()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "a.py"), []byte("def fn():\n    return 2\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	partial := NewCacheEngine(cfg, storage.NewGraphStorage(cfg.DBPath))
+	if _, err := partial.SyncTargetFile("a.py"); err != nil {
+		t.Fatal(err)
+	}
+	if counts := partial.db.CountNodesAndEdges(); counts["l1_modules"] != 1 {
+		t.Fatalf("expected the targeted sync to persist a partial graph, got %v", counts)
+	}
+
+	stats := partial.Sync(false)
+	if stats.Error != "" {
+		t.Fatalf("recovery sync failed: %s", stats.Error)
+	}
+	if stats.AddedCount != 2 {
+		t.Fatalf("expected a full re-parse after the graph was lost, got %+v", stats)
+	}
+	counts := partial.db.CountNodesAndEdges()
+	if counts["l1_modules"] != 2 {
+		t.Fatalf("graph was not rebuilt: %v", counts)
+	}
+}
+
 func TestSyncUpdatesDomainModuleCount(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "pkg"), 0755); err != nil {

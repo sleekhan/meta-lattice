@@ -63,11 +63,17 @@ type CacheFileInfo struct {
 }
 
 type CacheState struct {
-	Version   string                   `json:"version"`
-	LastSync  int64                    `json:"last_sync"`
-	GitCommit string                   `json:"git_commit"`
-	FullSync  bool                     `json:"full_sync"`
-	Files     map[string]CacheFileInfo `json:"files"`
+	Version   string `json:"version"`
+	LastSync  int64  `json:"last_sync"`
+	GitCommit string `json:"git_commit"`
+	FullSync  bool   `json:"full_sync"`
+	// GraphNodes and GraphEdges record how large the persisted graph was at the
+	// last successful save. They are a drift guard: if the graph file no longer
+	// matches, the next sync rebuilds instead of applying a delta to the wrong
+	// base. Older cache files simply carry zero here.
+	GraphNodes int                      `json:"graph_nodes,omitempty"`
+	GraphEdges int                      `json:"graph_edges,omitempty"`
+	Files      map[string]CacheFileInfo `json:"files"`
 }
 
 type SyncStats struct {
@@ -448,12 +454,15 @@ func (e *CacheEngine) Sync(force bool) SyncStats {
 		cachedFiles = make(map[string]CacheFileInfo)
 	}
 
-	// Rebuild only when the persisted graph was lost while the cache still
-	// claims indexed files. A targeted partial update (FullSync=false) must NOT
-	// force a full re-parse: the delta scan below already detects workspace
-	// drift, so re-parsing every file would only burn CPU.
-	if !force && len(cachedFiles) > 0 && e.db.CountNodesAndEdges()["total_nodes"] == 0 {
-		force = true
+	// Rebuild only when the persisted graph was lost or drifted while the cache
+	// still claims indexed files. A targeted partial update (FullSync=false)
+	// must NOT force a full re-parse: the delta scan below already detects
+	// workspace drift, so re-parsing every file would only burn CPU.
+	if !force && len(cachedFiles) > 0 {
+		counts := e.db.CountNodesAndEdges()
+		if counts["total_nodes"] == 0 || e.graphCountsDrifted(counts, len(cachedFiles)) {
+			force = true
+		}
 	}
 
 	var added []string
@@ -715,9 +724,11 @@ func (e *CacheEngine) Sync(force bool) SyncStats {
 	}
 
 	// Step 4 & 5: Resolve cross-file IMPORTS and CALLS edges
+	fullRebuild := false
 	if len(added) > 0 || len(modified) > 0 || len(deleted) > 0 || force {
 		if force || len(cachedFiles) == len(added) {
 			// Full rebuild for initial or forced sync
+			fullRebuild = true
 			e.db.DeleteEdgesByType(string(models.EdgeImports), string(models.EdgeCalls))
 
 			var allImportSpecs []ImportSpec
@@ -741,10 +752,16 @@ func (e *CacheEngine) Sync(force bool) SyncStats {
 		e.state.GitCommit = e.getGitCommit()
 		e.state.Files = cachedFiles
 		if graphChanged {
+			if fullRebuild {
+				// The graph was rebuilt from scratch, so writing it in one batch
+				// is cheaper than replaying a journal of this size.
+				e.db.RequestFullSave()
+			}
 			if err := e.db.Save(); err != nil {
 				e.state.FullSync = false
 				return SyncStats{ElapsedMS: int(time.Since(startTime).Milliseconds()), Error: fmt.Sprintf("save graph database: %v", err)}
 			}
+			e.recordGraphCounts()
 		}
 		e.state.FullSync = true
 		if err := e.saveCacheState(); err != nil {
@@ -791,6 +808,34 @@ func (e *CacheEngine) resolveWorkspacePath(target string) (relPath string, absPa
 		return "", "", false
 	}
 	return rel, candidate, true
+}
+
+// graphCountsDrifted reports whether the in-memory graph no longer matches what
+// the cache state claims is indexed. A mismatch means the persisted file is not
+// the base the delta was computed against, so the next sync rebuilds instead of
+// replaying a journal onto a stale graph.
+func (e *CacheEngine) graphCountsDrifted(counts map[string]int, cachedFiles int) bool {
+	if e.state.GraphNodes > 0 && counts["total_nodes"] != e.state.GraphNodes {
+		return true
+	}
+	if e.state.GraphEdges > 0 && counts["total_edges"] != e.state.GraphEdges {
+		return true
+	}
+	// Every cached file owns exactly one L1 module node. Fewer module nodes than
+	// cached files means part of the graph was lost even when the recorded
+	// counts happen to match a partially rebuilt file (for example a targeted
+	// sync that ran after the database file was deleted).
+	if cachedFiles > 0 && counts["l1_modules"] != cachedFiles {
+		return true
+	}
+	return false
+}
+
+// recordGraphCounts stores the persisted graph size for the drift guard.
+func (e *CacheEngine) recordGraphCounts() {
+	counts := e.db.CountNodesAndEdges()
+	e.state.GraphNodes = counts["total_nodes"]
+	e.state.GraphEdges = counts["total_edges"]
 }
 
 // unchangedStats reports the current index state for a targeted sync that has
@@ -973,6 +1018,7 @@ func (e *CacheEngine) SyncTargetFile(target string) (SyncStats, error) {
 		stats.Error = fmt.Sprintf("save graph database: %v", err)
 		return stats, fmt.Errorf("save graph database: %w", err)
 	}
+	e.recordGraphCounts()
 	if err := e.saveCacheState(); err != nil {
 		stats.ElapsedMS = int(time.Since(startTime).Milliseconds())
 		stats.Error = fmt.Sprintf("save cache state: %v", err)
