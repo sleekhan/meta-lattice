@@ -41,16 +41,20 @@ func (a *ArchitectureBoundaryAuditor) getModuleGraph() *moduleGraph {
 		inEdges:  make(map[string][]moduleEdge),
 	}
 
-	for id, n := range a.db.AllNodes() {
-		lvl, _ := n["level"].(string)
-		if lvl == string(models.LevelL1) {
-			filePath, _ := n["path"].(string)
-			if filePath == "" {
-				filePath = strings.TrimPrefix(id, "file:")
-			}
-			mg.nodes[filePath] = n
+	a.db.RangeNodes(func(id string, n map[string]any) {
+		if lvl, _ := n["level"].(string); lvl != string(models.LevelL1) {
+			return
 		}
-	}
+		filePath, _ := n["path"].(string)
+		if filePath == "" {
+			filePath = strings.TrimPrefix(id, "file:")
+		}
+		cp := make(map[string]any, len(n))
+		for k, v := range n {
+			cp[k] = v
+		}
+		mg.nodes[filePath] = cp
+	})
 
 	for _, e := range a.db.GetEdgesByType(string(models.EdgeImports)) {
 		srcNode, okSrc := a.db.GetNode(e.SourceID)

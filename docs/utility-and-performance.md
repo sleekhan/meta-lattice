@@ -76,6 +76,25 @@ Meta-Lattice incorporates a **2-tier cache engine combining SHA-256 content hash
 - `audit` and `blast` took ~0.15s and ~0.11s respectively on the same dataset (including process startup and DB loading).
 - Scenarios involving branch switches with dozens of changed files on very large repositories have not been profiled.
 
+#### Incremental persistence (write path)
+
+`GraphStorage` journals the **final intent** of every node and edge touched since the last successful save, then replays that delta into the existing `.lattice` file in one LatticeDB transaction ([`backend_latticedb.go`](../src/storage/backend_latticedb.go)). Only an initial or forced sync (and a few recovery cases) rewrites the file from scratch.
+
+> 📏 **Measurement Environment**: `meta-lattice sync` inside the Linux/arm64 builder container, synthetic Python workspace (5 functions per file, 20 packages). The graph file was 51 MB at 1,000 files (6,021 nodes / 6,001 edges) and 154 MB at 3,000 files (18,021 nodes / 18,001 edges).
+
+| Scenario | Save cost (graph write) | Whole command |
+| :--- | :--- | :--- |
+| One file edited, 1,000 files | **~23 ms** (journal replay) | ~1.07 s |
+| One file edited, 3,000 files | **~62 ms** (journal replay) | ~3.24 s |
+| No changes | 0 ms (no write) | ~1.04 s / ~3.24 s |
+| Initial or forced sync | full rewrite | dominated by parsing |
+
+- The remaining per-command cost is loading the graph into memory (open + two Cypher scans: ~1.0 s at 6k nodes, ~3.2 s at 18k nodes), not persistence.
+- A full rewrite is still used when: the file does not exist, a sync is forced (`--force`, cache version change, drift), the delta exceeds `max(2000, (nodes+edges)/4)` operations, or the file cannot be updated in place (missing indexes, duplicate ids).
+- The replay is idempotent (edge upserts are delete-then-create, because LatticeDB permits duplicate `(source, type, target)` edges) and atomic (a failed transaction leaves the previous file untouched).
+- If another process holds the database lock, the save fails with an explicit error and keeps the pending journal instead of clobbering that writer; the next sync retries.
+- `.lattice/cache_state.json` stores the persisted node/edge counts. If they no longer match the graph, the next sync rebuilds instead of applying a delta to a stale base.
+
 > ⚡ **Operational Behavior**: If query tools (`zoom_*`, `check_layer_violation`, `estimate_blast_radius`) are called while the index is empty, Meta-Lattice builds the index automatically on the first call. To sync subsequent code modifications, call `sync_index` (or `meta-lattice sync`). CLI commands `zoom`/`audit`/`blast` execute incremental sync automatically before querying.
 
 ---

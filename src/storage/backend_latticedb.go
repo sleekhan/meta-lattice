@@ -3,15 +3,415 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 
 	latticedb "github.com/jeffhajewski/latticedb/bindings/go"
 	"meta-lattice/src/models"
 )
 
 const HasNativeLatticeDB = true
+
+// identityIndexLabels are the node labels that carry the stable string id.
+// FindNodesByLabelProperty only answers for an explicitly indexed
+// (label, property) pair, so every one of them needs an "id" index before the
+// journal can be replayed.
+var identityIndexLabels = []string{"L0Domain", "L1Module", "L2Class", "L3Symbol"}
+
+const (
+	latticeOpenRetries = 10
+	latticeOpenBackoff = 20 * time.Millisecond
+)
+
+// identityLabel picks the level label (L0Domain..L3Symbol) of a node. Labels
+// such as "File" or "Function" are decorative and are not indexed.
+func identityLabel(labels []string) string {
+	for _, label := range labels {
+		for _, known := range identityIndexLabels {
+			if label == known {
+				return label
+			}
+		}
+	}
+	return ""
+}
+
+// nodePropertyMap converts our node to LatticeDB properties. "id" is always
+// written from the stable string id so a node cannot be indexed under a stale
+// value.
+func nodePropertyMap(id string, properties map[string]any) map[string]latticedb.Value {
+	props := make(map[string]latticedb.Value, len(properties)+1)
+	props["id"] = id
+	for k, v := range properties {
+		if k == "id" {
+			continue
+		}
+		if lv := toLatticeValue(v); lv != nil {
+			props[k] = lv
+		}
+	}
+	return props
+}
+
+func edgePropertyMap(properties map[string]any) map[string]latticedb.Value {
+	props := make(map[string]latticedb.Value, len(properties))
+	for k, v := range properties {
+		if lv := toLatticeValue(v); lv != nil {
+			props[k] = lv
+		}
+	}
+	return props
+}
+
+// splitEdgeKey reverses edgeKey(source, type, target).
+func splitEdgeKey(key string) (source, edgeType, target string, ok bool) {
+	parts := strings.SplitN(key, "\x00", 3)
+	if len(parts) != 3 {
+		return "", "", "", false
+	}
+	return parts[0], parts[1], parts[2], true
+}
+
+// isLatticeLockError reports whether another process (or a read-only open while
+// a writer is active) is holding the database lock.
+func isLatticeLockError(err error) bool {
+	return errors.Is(err, &latticedb.Error{Code: latticedb.ErrorDatabaseLocked}) ||
+		errors.Is(err, &latticedb.Error{Code: latticedb.ErrorLockTimeout})
+}
+
+// openLatticeWithRetry opens the database, waiting briefly for a concurrent
+// writer to release its lock. A lock conflict is reported as errDatabaseLocked
+// so callers keep their pending changes instead of rebuilding the file.
+func openLatticeWithRetry(path string, opts latticedb.OpenOptions) (*latticedb.DB, error) {
+	var err error
+	for attempt := 0; attempt < latticeOpenRetries; attempt++ {
+		var db *latticedb.DB
+		db, err = latticedb.Open(path, opts)
+		if err == nil {
+			return db, nil
+		}
+		if !isLatticeLockError(err) {
+			return nil, err
+		}
+		time.Sleep(latticeOpenBackoff)
+	}
+	return nil, fmt.Errorf("%w: %v", errDatabaseLocked, err)
+}
+
+// ensureIdentityIndexes makes sure the (label, "id") indexes the journal replay
+// relies on exist. Indexes persist in the file, so this is a no-op after the
+// first save; a database that cannot be indexed at all is rebuilt instead.
+func ensureIdentityIndexes(db *latticedb.DB) error {
+	for _, label := range identityIndexLabels {
+		err := db.CreateNodePropertyIndex(label, "id")
+		if err == nil {
+			continue
+		}
+		if errors.Is(err, &latticedb.Error{Code: latticedb.ErrorAlreadyExists}) {
+			continue
+		}
+		if errors.Is(err, &latticedb.Error{Code: latticedb.ErrorUnsupported}) {
+			return fmt.Errorf("%w: identity indexes unsupported: %v", errIncrementalUnavailable, err)
+		}
+		return fmt.Errorf("%w: create %s index: %v", errIncrementalUnavailable, label, err)
+	}
+	return nil
+}
+
+// nodeResolver maps stable string ids to LatticeDB node ids inside one
+// transaction. It remembers both directions so edge prefetching and repeated
+// lookups stay cheap.
+type nodeResolver struct {
+	tx        *latticedb.Tx
+	labelByID map[string]string
+	resolved  map[string]latticedb.NodeID
+	missing   map[string]bool
+}
+
+func newNodeResolver(tx *latticedb.Tx, journal *graphJournal, nodes map[string]*NodeData) *nodeResolver {
+	labelByID := make(map[string]string, len(nodes)+len(journal.nodes))
+	for id, node := range nodes {
+		if label := identityLabel(node.Labels); label != "" {
+			labelByID[id] = label
+		}
+	}
+	for id, mutation := range journal.nodes {
+		if label := identityLabel(mutation.labels); label != "" {
+			labelByID[id] = label
+		}
+	}
+	return &nodeResolver{
+		tx:        tx,
+		labelByID: labelByID,
+		resolved:  make(map[string]latticedb.NodeID),
+		missing:   make(map[string]bool),
+	}
+}
+
+// resolve looks an id up by (label, id). An id that appears under more than one
+// node means the file is inconsistent and a rebuild is the only safe fix.
+func (r *nodeResolver) resolve(id string) (latticedb.NodeID, bool, error) {
+	if nodeID, ok := r.resolved[id]; ok {
+		return nodeID, true, nil
+	}
+	if r.missing[id] {
+		return 0, false, nil
+	}
+
+	label, ok := r.labelByID[id]
+	if !ok {
+		r.missing[id] = true
+		return 0, false, nil
+	}
+
+	ids, err := r.tx.FindNodesByLabelProperty(label, "id", id, 2)
+	if err != nil {
+		if errors.Is(err, &latticedb.Error{Code: latticedb.ErrorUnsupported}) {
+			return 0, false, fmt.Errorf("%w: lookup %s: %v", errIncrementalUnavailable, id, err)
+		}
+		return 0, false, err
+	}
+	if len(ids) == 0 {
+		r.missing[id] = true
+		return 0, false, nil
+	}
+	if len(ids) > 1 {
+		return 0, false, fmt.Errorf("%w: duplicate nodes for id %s", errIncrementalUnavailable, id)
+	}
+	r.resolved[id] = ids[0]
+	return ids[0], true, nil
+}
+
+func (r *nodeResolver) remember(id string, nodeID latticedb.NodeID) {
+	r.resolved[id] = nodeID
+	delete(r.missing, id)
+}
+
+// applyJournalToLatticeDB replays the mutation journal against the existing
+// database file in a single transaction. Nothing is written when the
+// transaction fails, so a failed replay can safely fall back to a rebuild.
+func applyJournalToLatticeDB(latticePath string, journal *graphJournal, nodes map[string]*NodeData) error {
+	if journal == nil || journal.ops() == 0 {
+		return nil
+	}
+
+	db, err := openLatticeWithRetry(latticePath, latticedb.OpenOptions{
+		Create:               false,
+		CacheSizeMB:          128,
+		EnableAdjacencyCache: true,
+	})
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	if err := ensureIdentityIndexes(db); err != nil {
+		return err
+	}
+
+	err = db.Update(func(tx *latticedb.Tx) error {
+		return applyJournalTx(tx, journal, nodes)
+	})
+	if err == nil {
+		return nil
+	}
+
+	if errors.Is(err, errIncrementalUnavailable) {
+		return err
+	}
+	if isLatticeLockError(err) {
+		return fmt.Errorf("%w: %v", errDatabaseLocked, err)
+	}
+	// Any other failure leaves the file as it was; rebuild it from memory.
+	return fmt.Errorf("%w: %v", errIncrementalUnavailable, err)
+}
+
+// applyJournalTx applies the journal in dependency order: edge removals first
+// (so no edge is left dangling), then node removals, node upserts and finally
+// edge upserts.
+func applyJournalTx(tx *latticedb.Tx, journal *graphJournal, nodes map[string]*NodeData) error {
+	resolver := newNodeResolver(tx, journal, nodes)
+
+	deleting := make(map[string]struct{})
+	for id, mutation := range journal.nodes {
+		if mutation.delete {
+			deleting[id] = struct{}{}
+		}
+	}
+
+	type edgeOp struct {
+		source string
+		target string
+		typ    string
+		mut    edgeMutation
+	}
+	edgeOps := make([]edgeOp, 0, len(journal.edges))
+	for key, mutation := range journal.edges {
+		source, typ, target, ok := splitEdgeKey(key)
+		if !ok {
+			return fmt.Errorf("%w: malformed edge key %q", errIncrementalUnavailable, key)
+		}
+		edgeOps = append(edgeOps, edgeOp{source: source, target: target, typ: typ, mut: mutation})
+	}
+
+	// LatticeDB silently accepts edges pointing at deleted nodes, so an edge is
+	// only written when both endpoints exist after this transaction.
+	available := make(map[string]bool, len(journal.nodes))
+	endpointOK := func(id string) (bool, error) {
+		if _, gone := deleting[id]; gone {
+			return false, nil
+		}
+		if ok, seen := available[id]; seen {
+			return ok, nil
+		}
+		if mutation, ok := journal.nodes[id]; ok && !mutation.delete {
+			// Created by this transaction; resolve() cannot see it yet.
+			available[id] = true
+			return true, nil
+		}
+		_, ok, err := resolver.resolve(id)
+		if err != nil {
+			return false, err
+		}
+		available[id] = ok
+		return ok, nil
+	}
+
+	// 1. Edge removals.
+	for _, op := range edgeOps {
+		if !op.mut.delete {
+			continue
+		}
+		sourceID, ok, err := resolver.resolve(op.source)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+		targetID, ok, err := resolver.resolve(op.target)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+		if err := tx.DeleteEdge(sourceID, targetID, op.typ); err != nil && !isNotFound(err) {
+			return err
+		}
+	}
+
+	// 2. Node removals. LatticeDB does not cascade, but every incident edge was
+	// journaled by DeleteNode, so the graph stays consistent.
+	for id, mutation := range journal.nodes {
+		if !mutation.delete {
+			continue
+		}
+		nodeID, ok, err := resolver.resolve(id)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+		if err := tx.DeleteNode(nodeID); err != nil && !isNotFound(err) {
+			return err
+		}
+	}
+
+	// 3. Node upserts. Every node kind writes a fixed property key set, so
+	// overwriting each key is enough; LatticeDB has no property removal API.
+	for id, mutation := range journal.nodes {
+		if mutation.delete {
+			continue
+		}
+		node, ok := nodes[id]
+		if !ok {
+			continue
+		}
+		props := nodePropertyMap(id, node.Properties)
+
+		nodeID, exists, err := resolver.resolve(id)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			labels := node.Labels
+			if len(labels) == 0 {
+				labels = mutation.labels
+			}
+			if len(labels) == 0 {
+				labels = []string{"Node"}
+			}
+			created, err := tx.CreateNode(latticedb.CreateNodeOptions{
+				Labels:     labels,
+				Properties: props,
+			})
+			if err != nil {
+				return err
+			}
+			resolver.remember(id, created.ID)
+			available[id] = true
+			continue
+		}
+		for key, value := range props {
+			if err := tx.SetProperty(nodeID, key, value); err != nil {
+				return err
+			}
+		}
+	}
+
+	// 4. Edge upserts. LatticeDB allows duplicate (source, type, target) edges
+	// and DeleteEdge only removes one, so every upsert is a delete-then-create.
+	for _, op := range edgeOps {
+		if op.mut.delete {
+			continue
+		}
+		sourceAvailable, err := endpointOK(op.source)
+		if err != nil {
+			return err
+		}
+		targetAvailable, err := endpointOK(op.target)
+		if err != nil {
+			return err
+		}
+		if !sourceAvailable || !targetAvailable {
+			continue
+		}
+		sourceID, ok, err := resolver.resolve(op.source)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+		targetID, ok, err := resolver.resolve(op.target)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+		if err := tx.DeleteEdge(sourceID, targetID, op.typ); err != nil && !isNotFound(err) {
+			return err
+		}
+		if _, err := tx.CreateEdge(sourceID, targetID, op.typ, latticedb.CreateEdgeOptions{
+			Properties: edgePropertyMap(op.mut.props),
+		}); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func isNotFound(err error) bool {
+	return errors.Is(err, &latticedb.Error{Code: latticedb.ErrorNotFound})
+}
 
 func toLatticeValue(val any) latticedb.Value {
 	if val == nil {
@@ -89,20 +489,9 @@ func saveToLatticeDB(latticePath string, nodes map[string]*NodeData, outEdges ma
 				labels = []string{"Node"}
 			}
 
-			nodeProps := make(map[string]latticedb.Value, len(node.Properties)+1)
-			nodeProps["id"] = node.ID
-			for k, v := range node.Properties {
-				if k == "id" {
-					continue
-				}
-				if lv := toLatticeValue(v); lv != nil {
-					nodeProps[k] = lv
-				}
-			}
-
 			n, err := tx.CreateNode(latticedb.CreateNodeOptions{
 				Labels:     labels,
-				Properties: nodeProps,
+				Properties: nodePropertyMap(node.ID, node.Properties),
 			})
 			if err != nil {
 				return fmt.Errorf("failed to create node %s: %w", node.ID, err)
@@ -122,20 +511,13 @@ func saveToLatticeDB(latticePath string, nodes map[string]*NodeData, outEdges ma
 					continue
 				}
 
-				edgeProps := make(map[string]latticedb.Value)
-				for k, v := range edge.Properties {
-					if lv := toLatticeValue(v); lv != nil {
-						edgeProps[k] = lv
-					}
-				}
-
 				edgeType := edge.EdgeType
 				if edgeType == "" {
 					edgeType = "RELATES"
 				}
 
 				_, _ = tx.CreateEdge(srcNodeID, tgtNodeID, edgeType, latticedb.CreateEdgeOptions{
-					Properties: edgeProps,
+					Properties: edgePropertyMap(edge.Properties),
 				})
 			}
 		}
@@ -144,8 +526,13 @@ func saveToLatticeDB(latticePath string, nodes map[string]*NodeData, outEdges ma
 	})
 
 	if err == nil {
-		// Create B-Tree property indexes on the newly populated database for fast O(1) lookups
-		_ = db.CreateNodePropertyIndex("Node", "id")
+		// Create B-Tree property indexes on the newly populated database for fast O(1) lookups.
+		// Every node is indexed by its stable string id under its own label: a
+		// single "Node" label index would never match, because nodes only carry
+		// their level labels.
+		for _, label := range identityIndexLabels {
+			_ = db.CreateNodePropertyIndex(label, "id")
+		}
 		_ = db.CreateNodePropertyIndex("L0Domain", "name")
 		_ = db.CreateNodePropertyIndex("L1Module", "path")
 		_ = db.CreateNodePropertyIndex("L2Class", "name")
@@ -186,7 +573,7 @@ func loadFromLatticeDB(latticePath string) (map[string]*NodeData, map[string][]m
 		return nil, nil, nil, err
 	}
 
-	db, err := latticedb.Open(latticePath, latticedb.OpenOptions{
+	db, err := openLatticeWithRetry(latticePath, latticedb.OpenOptions{
 		Create:               false,
 		ReadOnly:             true,
 		CacheSizeMB:          128,
