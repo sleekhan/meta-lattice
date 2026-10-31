@@ -2,6 +2,7 @@ package storage
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,6 +12,15 @@ import (
 
 	"meta-lattice/src/models"
 )
+
+// errIncrementalUnavailable means the native file cannot be updated in place and
+// has to be rebuilt from the in-memory graph.
+var errIncrementalUnavailable = errors.New("incremental persistence unavailable")
+
+// errDatabaseLocked means another process is holding the LatticeDB file lock.
+// Rebuilding would clobber that writer, so the pending changes are kept and the
+// caller retries later.
+var errDatabaseLocked = errors.New("graph database is locked by another process")
 
 type NodeData struct {
 	ID         string         `json:"id"`
@@ -35,7 +45,53 @@ type GraphStorage struct {
 	countsValid bool
 	bm25Loaded  bool
 	dirty       bool
-	loadedMtime int64
+	// journal records the final intent for every node and edge touched since
+	// the last successful save, so a native backend can persist just that delta
+	// instead of rebuilding the whole file. It is nil when nothing changed.
+	journal *graphJournal
+	// lastSaveMode / lastSaveOps are diagnostics for tests and benchmarks.
+	lastSaveMode string
+	lastSaveOps  int
+	loadedMtime  int64
+}
+
+// nodeMutation is the final intent for one node since the last save.
+type nodeMutation struct {
+	labels []string
+	delete bool
+}
+
+// edgeMutation is the final intent for one edge since the last save. Properties
+// are kept for upserts; a delete only needs the (source, type, target) key.
+type edgeMutation struct {
+	props  map[string]any
+	delete bool
+}
+
+// graphJournal is the delta between the in-memory graph and the persisted one.
+// Keys are our stable string IDs; later mutations overwrite earlier ones, so
+// only the final state of each node and edge is applied.
+type graphJournal struct {
+	nodes map[string]nodeMutation
+	edges map[string]edgeMutation
+	// forceRebuild asks Save to rewrite the whole file. It is set when the
+	// delta grows to a size where a rebuild is cheaper, and when the backend
+	// cannot apply the journal incrementally.
+	forceRebuild bool
+}
+
+func newGraphJournal() *graphJournal {
+	return &graphJournal{
+		nodes: make(map[string]nodeMutation),
+		edges: make(map[string]edgeMutation),
+	}
+}
+
+func (j *graphJournal) ops() int {
+	if j == nil {
+		return 0
+	}
+	return len(j.nodes) + len(j.edges)
 }
 
 type serializedState struct {
@@ -65,6 +121,11 @@ func NewGraphStorage(storagePath string) *GraphStorage {
 		bm25:        NewBM25Index(),
 	}
 	if err := gs.Load(); err != nil && !os.IsNotExist(err) {
+		if errors.Is(err, errDatabaseLocked) {
+			// Another process is writing; the file is fine, so do not touch it.
+			fmt.Fprintf(os.Stderr, "meta-lattice: %s is busy (%v); starting with an empty graph\n", storagePath, err)
+			return gs
+		}
 		fmt.Fprintf(os.Stderr, "meta-lattice: failed to load %s (%v); starting with an empty graph\n", storagePath, err)
 		if os.IsPermission(err) {
 			return gs
@@ -93,6 +154,10 @@ func (s *GraphStorage) Load() error {
 		if fi, statErr := os.Stat(s.latticePath); statErr == nil {
 			nodes, outEdges, inEdges, err := loadFromLatticeDB(s.latticePath)
 			if err != nil {
+				if errors.Is(err, errDatabaseLocked) {
+					// Another process is writing; the file is not corrupt.
+					return err
+				}
 				return fmt.Errorf("corrupt LatticeDB file: %w", err)
 			}
 			s.nodes = nodes
@@ -102,6 +167,9 @@ func (s *GraphStorage) Load() error {
 			s.bm25.Clear()
 			s.bm25Loaded = false
 			s.dirty = false
+			s.journal = nil
+			s.lastSaveMode = ""
+			s.lastSaveOps = 0
 			s.countsValid = false
 			s.loadedMtime = fi.ModTime().UnixNano()
 			return nil
@@ -125,6 +193,9 @@ func (s *GraphStorage) Load() error {
 	s.bm25.Clear()
 	s.bm25Loaded = false
 	s.dirty = false
+	s.journal = nil
+	s.lastSaveMode = ""
+	s.lastSaveOps = 0
 	if fi, statErr := os.Stat(s.filePath); statErr == nil {
 		s.loadedMtime = fi.ModTime().UnixNano()
 	}
@@ -154,23 +225,28 @@ func (s *GraphStorage) Save() error {
 	defer s.mu.Unlock()
 
 	if !s.dirty {
+		s.lastSaveMode = "none"
+		s.lastSaveOps = 0
 		return nil
 	}
 
 	// 1. If native LatticeDB is compiled in, persist exclusively to .lattice
 	if HasNativeLatticeDB {
-		err := saveToLatticeDB(s.latticePath, s.nodes, s.outEdges)
-		if err == nil {
-			s.dirty = false
-			if fi, statErr := os.Stat(s.latticePath); statErr == nil {
-				s.loadedMtime = fi.ModTime().UnixNano()
-			}
-			// Clean up legacy fallback JSON file once migrated to native LatticeDB
-			if s.filePath != s.latticePath {
-				_ = os.Remove(s.filePath)
-			}
+		mode, ops, err := s.saveNativeLocked()
+		if err != nil {
+			return err
 		}
-		return err
+		s.lastSaveMode, s.lastSaveOps = mode, ops
+		s.dirty = false
+		s.journal = nil
+		if fi, statErr := os.Stat(s.latticePath); statErr == nil {
+			s.loadedMtime = fi.ModTime().UnixNano()
+		}
+		// Clean up legacy fallback JSON file once migrated to native LatticeDB
+		if s.filePath != s.latticePath {
+			_ = os.Remove(s.filePath)
+		}
+		return nil
 	}
 
 	// 2. Fallback: Persist to atomic JSON when LatticeDB is not available (e.g. CGO-disabled builds)
@@ -199,11 +275,49 @@ func (s *GraphStorage) Save() error {
 	if err := os.Rename(tmpFile, s.filePath); err != nil {
 		return err
 	}
+	s.lastSaveMode, s.lastSaveOps = "full", s.journal.ops()
 	s.dirty = false
+	s.journal = nil
 	if fi, statErr := os.Stat(s.filePath); statErr == nil {
 		s.loadedMtime = fi.ModTime().UnixNano()
 	}
 	return nil
+}
+
+// saveNativeLocked writes the graph to the native LatticeDB file, replaying the
+// journal when it is safe to do so and rebuilding the file otherwise. The
+// caller holds the write lock.
+func (s *GraphStorage) saveNativeLocked() (mode string, ops int, err error) {
+	ops = s.journal.ops()
+
+	rebuild := func() (string, int, error) {
+		if err := saveToLatticeDB(s.latticePath, s.nodes, s.outEdges); err != nil {
+			return "", ops, err
+		}
+		return "full", ops, nil
+	}
+
+	if s.journal == nil || s.journal.forceRebuild || ops == 0 {
+		return rebuild()
+	}
+	// A missing file has to be created from scratch.
+	if _, statErr := os.Stat(s.latticePath); statErr != nil {
+		return rebuild()
+	}
+
+	err = applyJournalToLatticeDB(s.latticePath, s.journal, s.nodes)
+	if err == nil {
+		return "incremental", ops, nil
+	}
+	if errors.Is(err, errIncrementalUnavailable) {
+		// The file cannot be updated in place (old database without the id
+		// indexes, duplicate node ids, ...). One rebuild puts it back in shape.
+		return rebuild()
+	}
+	// A lock conflict or a failed transaction leaves the file untouched, so
+	// keep the journal and let the caller retry rather than clobbering a
+	// database that another process may be writing.
+	return "", ops, err
 }
 
 func (s *GraphStorage) IsDirty() bool {
@@ -299,6 +413,79 @@ func (s *GraphStorage) markDirtyLocked() {
 	s.countsValid = false
 }
 
+// journalLocked returns the journal, allocating it on first use.
+func (s *GraphStorage) journalLocked() *graphJournal {
+	if s.journal == nil {
+		s.journal = newGraphJournal()
+	}
+	return s.journal
+}
+
+// journalOverflowLocked switches to a full rewrite once the delta is large
+// enough that replaying it is no cheaper than rebuilding the file. The floor
+// keeps small graphs on the incremental path.
+func (s *GraphStorage) journalOverflowLocked() {
+	j := s.journal
+	if j == nil || j.forceRebuild {
+		return
+	}
+	limit := (len(s.nodes) + len(s.edgeIndex)) / 4
+	if limit < 2000 {
+		limit = 2000
+	}
+	if j.ops() > limit {
+		j.forceRebuild = true
+	}
+}
+
+func (s *GraphStorage) journalNodeUpsertLocked(id string, labels []string) {
+	j := s.journalLocked()
+	j.nodes[id] = nodeMutation{labels: labels}
+	s.journalOverflowLocked()
+}
+
+func (s *GraphStorage) journalNodeDeleteLocked(id string, labels []string) {
+	j := s.journalLocked()
+	j.nodes[id] = nodeMutation{labels: labels, delete: true}
+	s.journalOverflowLocked()
+}
+
+func (s *GraphStorage) journalEdgeUpsertLocked(sourceID, targetID, edgeType string, properties map[string]any) {
+	j := s.journalLocked()
+	j.edges[edgeKey(sourceID, targetID, edgeType)] = edgeMutation{props: properties}
+	s.journalOverflowLocked()
+}
+
+func (s *GraphStorage) journalEdgeDeleteLocked(sourceID, targetID, edgeType string) {
+	j := s.journalLocked()
+	j.edges[edgeKey(sourceID, targetID, edgeType)] = edgeMutation{delete: true}
+	s.journalOverflowLocked()
+}
+
+// RequestFullSave makes the next Save rewrite the whole database file instead
+// of applying the journal. Callers use it when they already know the graph was
+// rebuilt from scratch, which is cheaper as one batch.
+func (s *GraphStorage) RequestFullSave() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.journalLocked().forceRebuild = true
+}
+
+// LastSaveMode reports how the previous Save persisted the graph: "none",
+// "full" or "incremental".
+func (s *GraphStorage) LastSaveMode() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.lastSaveMode
+}
+
+// LastSaveOps reports how many journal entries the previous Save carried.
+func (s *GraphStorage) LastSaveOps() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.lastSaveOps
+}
+
 func (s *GraphStorage) CreateNode(id string, labels []string, properties map[string]any) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -317,6 +504,7 @@ func (s *GraphStorage) CreateNode(id string, labels []string, properties map[str
 		Properties: propsCopy,
 	}
 	s.nodes[id] = node
+	s.journalNodeUpsertLocked(id, labels)
 	if s.bm25Loaded {
 		s.indexNodeBM25(node)
 	}
@@ -349,16 +537,27 @@ func (s *GraphStorage) DeleteNode(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	existing, exists := s.nodes[id]
+	if !exists {
+		// Nothing to remove; deleting a node twice must not dirty the graph.
+		return
+	}
+
 	s.markDirtyLocked()
 	delete(s.nodes, id)
 	if s.bm25Loaded {
 		s.bm25.RemoveDocument(id)
 	}
 
+	// LatticeDB does not cascade edge removal, so every incident edge is
+	// journaled for deletion before the node itself goes away.
+	s.journalNodeDeleteLocked(id, existing.Labels)
+
 	// Remove outgoing edges
 	if outList, ok := s.outEdges[id]; ok {
 		for _, e := range outList {
 			delete(s.edgeIndex, edgeKey(id, e.TargetID, e.EdgeType))
+			s.journalEdgeDeleteLocked(id, e.TargetID, e.EdgeType)
 			// Remove from target's inEdges
 			inList := s.inEdges[e.TargetID]
 			var updated []models.GraphEdge
@@ -376,6 +575,7 @@ func (s *GraphStorage) DeleteNode(id string) {
 	if inList, ok := s.inEdges[id]; ok {
 		for _, e := range inList {
 			delete(s.edgeIndex, edgeKey(e.SourceID, id, e.EdgeType))
+			s.journalEdgeDeleteLocked(e.SourceID, id, e.EdgeType)
 			// Remove from source's outEdges
 			outList := s.outEdges[e.SourceID]
 			var updated []models.GraphEdge
@@ -430,6 +630,7 @@ func (s *GraphStorage) CreateEdge(sourceID, targetID, edgeType string, propertie
 		if found {
 			if changed {
 				s.markDirtyLocked()
+				s.journalEdgeUpsertLocked(sourceID, targetID, edgeType, copyProperties(properties))
 			}
 			return
 		}
@@ -446,6 +647,7 @@ func (s *GraphStorage) CreateEdge(sourceID, targetID, edgeType string, propertie
 	s.outEdges[sourceID] = append(s.outEdges[sourceID], edge)
 	s.inEdges[targetID] = append(s.inEdges[targetID], edge)
 	s.edgeIndex[key] = struct{}{}
+	s.journalEdgeUpsertLocked(sourceID, targetID, edgeType, edge.Properties)
 }
 
 // updateEdgeLocked rewrites the properties of an existing edge. It reports
@@ -502,17 +704,19 @@ func (s *GraphStorage) DeleteEdgesByType(edgeTypes ...string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.markDirtyLocked()
 	typesSet := make(map[string]bool)
 	for _, t := range edgeTypes {
 		typesSet[t] = true
 	}
 
+	removed := false
 	for src, list := range s.outEdges {
 		var updated []models.GraphEdge
 		for _, e := range list {
 			if typesSet[e.EdgeType] {
 				delete(s.edgeIndex, edgeKey(src, e.TargetID, e.EdgeType))
+				s.journalEdgeDeleteLocked(src, e.TargetID, e.EdgeType)
+				removed = true
 				continue
 			}
 			updated = append(updated, e)
@@ -529,6 +733,10 @@ func (s *GraphStorage) DeleteEdgesByType(edgeTypes ...string) {
 		}
 		s.inEdges[tgt] = updated
 	}
+
+	if removed {
+		s.markDirtyLocked()
+	}
 }
 
 // DeleteEdgesForSource removes outgoing edges from sourceID matching the specified types (or all if empty).
@@ -536,17 +744,19 @@ func (s *GraphStorage) DeleteEdgesForSource(sourceID string, edgeTypes ...string
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.markDirtyLocked()
 	typesSet := make(map[string]bool)
 	for _, t := range edgeTypes {
 		typesSet[t] = true
 	}
 
+	removed := false
 	if outList, ok := s.outEdges[sourceID]; ok {
 		var remaining []models.GraphEdge
 		for _, e := range outList {
 			if len(typesSet) == 0 || typesSet[e.EdgeType] {
 				delete(s.edgeIndex, edgeKey(sourceID, e.TargetID, e.EdgeType))
+				s.journalEdgeDeleteLocked(sourceID, e.TargetID, e.EdgeType)
+				removed = true
 				inList := s.inEdges[e.TargetID]
 				var updatedIn []models.GraphEdge
 				for _, inE := range inList {
@@ -561,6 +771,10 @@ func (s *GraphStorage) DeleteEdgesForSource(sourceID string, edgeTypes ...string
 		}
 		s.outEdges[sourceID] = remaining
 	}
+
+	if removed {
+		s.markDirtyLocked()
+	}
 }
 
 // DeleteEdgesForTarget removes incoming edges to targetID matching the specified types (or all if empty).
@@ -568,17 +782,19 @@ func (s *GraphStorage) DeleteEdgesForTarget(targetID string, edgeTypes ...string
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.markDirtyLocked()
 	typesSet := make(map[string]bool)
 	for _, t := range edgeTypes {
 		typesSet[t] = true
 	}
 
+	removed := false
 	if inList, ok := s.inEdges[targetID]; ok {
 		var remaining []models.GraphEdge
 		for _, e := range inList {
 			if len(typesSet) == 0 || typesSet[e.EdgeType] {
 				delete(s.edgeIndex, edgeKey(e.SourceID, targetID, e.EdgeType))
+				s.journalEdgeDeleteLocked(e.SourceID, targetID, e.EdgeType)
+				removed = true
 				outList := s.outEdges[e.SourceID]
 				var updatedOut []models.GraphEdge
 				for _, outE := range outList {
@@ -592,6 +808,10 @@ func (s *GraphStorage) DeleteEdgesForTarget(targetID string, edgeTypes ...string
 			}
 		}
 		s.inEdges[targetID] = remaining
+	}
+
+	if removed {
+		s.markDirtyLocked()
 	}
 }
 
