@@ -401,8 +401,8 @@ cmd_native_linux() {
 
 cmd_test() {
     ensure_builder
-    echo "==> Docker test: go test ./tests (portable engine)..."
-    docker_go "CGO_ENABLED=0" -- test -count=1 "$@" ./tests
+    echo "==> Docker test: go test ./... (portable engine)..."
+    docker_go "CGO_ENABLED=0" -- test -count=1 -tags nolattice "$@" ./...
 }
 
 cmd_shell() {
