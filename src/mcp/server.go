@@ -339,7 +339,7 @@ func (s *MCPServer) listTools() []map[string]any {
 // an empty graph, so tools never return misleading "not found" results just
 // because sync_index has not been called yet.
 func (s *MCPServer) ensureIndexed() {
-	if s.db.CountNodesAndEdges()["total_nodes"] == 0 {
+	if !s.cacheEngine.IsFullyIndexed() {
 		s.cacheEngine.Sync(false)
 	}
 }

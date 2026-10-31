@@ -224,6 +224,8 @@ func (b *BlastRadiusEstimator) EstimateBlastRadius(symbolOrPath string, changeTy
 			lineStart := 0
 			if ls, ok := callerNode["line_start"].(int); ok {
 				lineStart = ls
+			} else if lsInt64, ok := callerNode["line_start"].(int64); ok {
+				lineStart = int(lsInt64)
 			} else if lsFloat, ok := callerNode["line_start"].(float64); ok {
 				lineStart = int(lsFloat)
 			}

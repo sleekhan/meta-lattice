@@ -521,6 +521,9 @@ func runApplyPlan(args []string) {
 		res["sync"] = stats
 	}
 	if err != nil {
+		if res == nil {
+			res = map[string]any{"error": err.Error(), "rollback": false}
+		}
 		if *asJSON {
 			printJSON(res)
 		} else {
@@ -586,13 +589,22 @@ func runInstall(args []string) {
 	doAgy := *all || *antigravity || !specific
 
 	if doClaude {
-		_ = inst.InstallClaudeCode()
+		if err := inst.InstallClaudeCode(); err != nil {
+			fmt.Fprintf(os.Stderr, "Claude Code installation failed: %v\n", err)
+			os.Exit(1)
+		}
 	}
 	if doCodex {
-		_ = inst.InstallCodex()
+		if err := inst.InstallCodex(); err != nil {
+			fmt.Fprintf(os.Stderr, "Codex installation failed: %v\n", err)
+			os.Exit(1)
+		}
 	}
 	if doAgy {
-		_ = inst.InstallAntigravity()
+		if err := inst.InstallAntigravity(); err != nil {
+			fmt.Fprintf(os.Stderr, "Antigravity installation failed: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	fmt.Println("\n[✓] Meta-Lattice installation complete!")
@@ -654,9 +666,20 @@ func runHook(args []string) {
 		startTime := time.Now()
 		var syncStats indexer.SyncStats
 		if targetFile != "" {
-			syncStats, _ = engine.SyncTargetFile(targetFile)
+			var syncErr error
+			syncStats, syncErr = engine.SyncTargetFile(targetFile)
+			if syncErr != nil {
+				syncStats.Error = syncErr.Error()
+				fmt.Fprintln(os.Stderr, syncErr)
+			}
 		} else {
 			syncStats = engine.Sync(false)
+			if syncStats.Error != "" {
+				fmt.Fprintln(os.Stderr, syncStats.Error)
+			}
+		}
+		if syncStats.Error != "" {
+			fmt.Fprintln(os.Stderr, syncStats.Error)
 		}
 
 		aud := auditor.NewArchitectureBoundaryAuditor(db, cfg)

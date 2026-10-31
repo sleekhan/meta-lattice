@@ -54,6 +54,20 @@ func (c *Codegen) resolvePath(relPath string) (string, string, error) {
 	if abs != c.WorkspaceRoot && !strings.HasPrefix(abs, root) {
 		return "", "", fmt.Errorf("path %q escapes workspace", relPath)
 	}
+	rootReal, err := filepath.EvalSymlinks(c.WorkspaceRoot)
+	if err != nil {
+		return "", "", fmt.Errorf("resolve workspace root: %w", err)
+	}
+	parentReal, err := filepath.EvalSymlinks(filepath.Dir(abs))
+	if err != nil && !os.IsNotExist(err) {
+		return "", "", fmt.Errorf("resolve target directory: %w", err)
+	}
+	if err == nil && parentReal != rootReal && !strings.HasPrefix(parentReal, rootReal+string(os.PathSeparator)) {
+		return "", "", fmt.Errorf("path %q escapes workspace through symlink", relPath)
+	}
+	if targetReal, err := filepath.EvalSymlinks(abs); err == nil && targetReal != rootReal && !strings.HasPrefix(targetReal, rootReal+string(os.PathSeparator)) {
+		return "", "", fmt.Errorf("path %q escapes workspace through symlink", relPath)
+	}
 	ext := strings.ToLower(filepath.Ext(rel))
 	if _, ok := indexer.SupportedExtensions[ext]; !ok {
 		return "", "", fmt.Errorf("extension %q is not an indexed source file", ext)
@@ -113,12 +127,12 @@ func (c *Codegen) ScaffoldModule(opts ScaffoldOptions) (map[string]any, error) {
 	}
 
 	return map[string]any{
-		"created":   rel,
-		"language":  lang,
-		"kind":      kind,
-		"name":      name,
-		"bytes":     len(content),
-		"guidance":  "Run `sync_index` to index the new module, then `zoom_module` to verify it.",
+		"created":  rel,
+		"language": lang,
+		"kind":     kind,
+		"name":     name,
+		"bytes":    len(content),
+		"guidance": "Run `sync_index` to index the new module, then `zoom_module` to verify it.",
 	}, nil
 }
 
@@ -304,4 +318,3 @@ func (c *Codegen) ApplyPlan(ops []PlanOperation, dryRun bool) (map[string]any, e
 		}(),
 	}, nil
 }
-

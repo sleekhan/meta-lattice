@@ -224,6 +224,8 @@ func loadFromLatticeDB(latticePath string) (map[string]*NodeData, map[string][]m
 		props, ok := row["props"].(map[string]any)
 		if !ok || props == nil {
 			props = make(map[string]any)
+		} else {
+			normalizeNodeProperties(props)
 		}
 
 		nodes[idStr] = &NodeData{

@@ -188,8 +188,14 @@ func (inst *Installer) InstallClaudeCode() error {
 	// 1. Configure ~/.claude.json
 	claudeConfigPath := filepath.Join(inst.HomeDir, ".claude.json")
 	var root map[string]any
-	if data, err := os.ReadFile(claudeConfigPath); err == nil && len(data) > 0 {
-		_ = json.Unmarshal(data, &root)
+	if data, err := os.ReadFile(claudeConfigPath); err == nil {
+		if len(data) > 0 {
+			if err := json.Unmarshal(data, &root); err != nil {
+				return fmt.Errorf("parse Claude Code config %s: %w", claudeConfigPath, err)
+			}
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("read Claude Code config %s: %w", claudeConfigPath, err)
 	}
 	if root == nil {
 		root = make(map[string]any)
@@ -222,7 +228,9 @@ func (inst *Installer) InstallClaudeCode() error {
 	}
 	for cmdName, template := range CommandTemplates {
 		cmdFile := filepath.Join(claudeCommandsDir, cmdName+".md")
-		_ = os.WriteFile(cmdFile, []byte(template), 0644)
+		if err := os.WriteFile(cmdFile, []byte(template), 0644); err != nil {
+			return fmt.Errorf("write Claude Code command %s: %w", cmdFile, err)
+		}
 		fmt.Printf("[✓] Claude Code slash command deployed: /%s\n", cmdName)
 	}
 
@@ -265,7 +273,9 @@ func (inst *Installer) InstallCodex() error {
 	if data, err := os.ReadFile(configPath); err == nil {
 		content = string(data)
 		// Backup
-		_ = os.WriteFile(configPath+".bak", data, 0644)
+		if err := os.WriteFile(configPath+".bak", data, 0644); err != nil {
+			return fmt.Errorf("backup Codex config: %w", err)
+		}
 
 		content = removeCodexBlock(content)
 		if strings.TrimSpace(content) == "" {
@@ -273,8 +283,10 @@ func (inst *Installer) InstallCodex() error {
 		} else {
 			content = strings.TrimRight(content, "\n") + "\n" + block
 		}
-	} else {
+	} else if os.IsNotExist(err) {
 		content = strings.TrimSpace(block) + "\n"
+	} else {
+		return fmt.Errorf("read Codex config %s: %w", configPath, err)
 	}
 
 	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
@@ -342,8 +354,14 @@ func (inst *Installer) InstallAntigravity() error {
 	// 1. mcp_config.json
 	mcpConfigPath := filepath.Join(geminiConfigDir, "mcp_config.json")
 	var root map[string]any
-	if data, err := os.ReadFile(mcpConfigPath); err == nil && len(data) > 0 {
-		_ = json.Unmarshal(data, &root)
+	if data, err := os.ReadFile(mcpConfigPath); err == nil {
+		if len(data) > 0 {
+			if err := json.Unmarshal(data, &root); err != nil {
+				return fmt.Errorf("parse Antigravity MCP config %s: %w", mcpConfigPath, err)
+			}
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("read Antigravity MCP config %s: %w", mcpConfigPath, err)
 	}
 	if root == nil {
 		root = make(map[string]any)
@@ -370,11 +388,18 @@ func (inst *Installer) InstallAntigravity() error {
 	fmt.Printf("[✓] Google Antigravity MCP config updated: %s\n", mcpConfigPath)
 
 	// 2. Deploy skills
+	if err := os.MkdirAll(geminiConfigDir, 0755); err != nil {
+		return err
+	}
 	for skillName, template := range SkillTemplates {
 		targetDir := filepath.Join(geminiSkillsDir, skillName)
-		_ = os.MkdirAll(targetDir, 0755)
+		if err := os.MkdirAll(targetDir, 0755); err != nil {
+			return fmt.Errorf("create Antigravity skill directory %s: %w", targetDir, err)
+		}
 		targetFile := filepath.Join(targetDir, "SKILL.md")
-		_ = os.WriteFile(targetFile, []byte(template), 0644)
+		if err := os.WriteFile(targetFile, []byte(template), 0644); err != nil {
+			return fmt.Errorf("write Antigravity skill %s: %w", targetFile, err)
+		}
 		fmt.Printf("[✓] Antigravity skill deployed: %s\n", skillName)
 	}
 
