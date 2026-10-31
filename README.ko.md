@@ -65,7 +65,7 @@
 * **결과 브리핑**: 0~100 점수의 **Blast Score**, 4단계 리스크 티어(`CRITICAL`, `HIGH`, `MODERATE`, `LOW`), Top 10 파괴적 변경 지점 및 ASCII 영향 전파 트리 출력.
 
 ### 4. 증분 AST 인덱서 & 로컬 캐시 엔진 (Incremental AST Cache)
-* **SHA-256 & Mtime 매핑**: 파일 SHA-256 해시와 mtime을 캐시 상태(`.lattice/cache_state.json`, v1.3)에 기록. 캐시 버전이 다르면 다음 sync에서 자동으로 전체 재인덱싱합니다.
+* **SHA-256 & Mtime 매핑**: 파일 SHA-256 해시와 mtime을 캐시 상태(`.lattice/cache_state.json`, v1.4)에 기록. 캐시 버전이 다르면 다음 sync에서 자동으로 전체 재인덱싱합니다.
 * **국소적 델타 엣지 갱신 (Localized Delta Invalidation)**: 파일이 수정되었을 때 전체 그래프를 지우지 않고 변경된 파일과 직접 관련된 의존 엣지만 $O(\Delta)$로 선별 삭제 후 갱신하여 수만 개 파일 환경에서도 밀리초 단위 재동기화를 달성합니다.
 * **상호 파일 의존성 자동 복원**: 파일 간 `IMPORTS` 엣지와 L3 심볼 간 최적 스코프(동일 클래스 우선, 동일 파일 우선, import된 파일 우선) `CALLS` 엣지를 자동 연결.
   * **Go**: 패키지 import를 `go.mod`의 module 경로 기준으로 해석해, 워크스페이스 내부 패키지의 (테스트 파일을 제외한) `.go` 파일에 `IMPORTS` 엣지를 연결합니다. 다중 `go.mod` 모노레포도 지원합니다.

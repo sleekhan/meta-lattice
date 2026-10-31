@@ -1,0 +1,47 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+
+      - name: Test pure-Go backend
+        run: CGO_ENABLED=0 go test -tags nolattice ./...
+
+      # The cgo bindings resolve `lattice` through pkg-config, and the checked-in
+      # lattice.pc points libdir at deps/latticedb/lib which only holds the macOS
+      # dylib. Generate a Linux-compatible .pc file pointing at linux-amd64.
+      - name: Prepare native LatticeDB (linux-amd64)
+        run: |
+          set -euo pipefail
+          prefix="$PWD/deps/latticedb"
+          libdir="$RUNNER_TEMP/lattice-lib"
+          pcdir="$RUNNER_TEMP/lattice-pc"
+          mkdir -p "$libdir" "$pcdir"
+          cp "$prefix/lib/linux-amd64/liblattice.so" "$libdir/"
+          sed -e "s|^prefix=.*|prefix=$prefix|" \
+              -e "s|^libdir=.*|libdir=$libdir|" \
+              -e "s|^includedir=.*|includedir=$prefix/include|" \
+              "$prefix/lib/pkgconfig/lattice.pc" > "$pcdir/lattice.pc"
+          {
+            echo "PKG_CONFIG_PATH=$pcdir"
+            echo "LD_LIBRARY_PATH=$libdir"
+            echo "CGO_LDFLAGS=-Wl,-rpath,$libdir"
+          } >> "$GITHUB_ENV"
+
+      - name: Test native LatticeDB backend
+        run: go test ./...
+
+      - name: Vet
+        run: go vet ./...

@@ -39,6 +39,9 @@ func TestIncrementalCacheLifecycleAndEdgesSurvive(t *testing.T) {
 	if stats.AddedCount != 2 {
 		t.Fatalf("expected 2 added files, got %d", stats.AddedCount)
 	}
+	if !engine.IsFullyIndexed() {
+		t.Fatal("full sync should mark the workspace indexed")
+	}
 
 	// Verify edges
 	impEdges := db.GetOutgoingEdges("file:pkg/user.py", string(models.EdgeImports))

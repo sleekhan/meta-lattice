@@ -5,7 +5,7 @@
 BINARY_NAME=meta-lattice
 WIN_BINARY_NAME=meta-lattice.exe
 SRC_DIR=./src
-TEST_DIR=./tests
+TEST_DIR=./...
 VERSION?=v1.0.0
 PWD=$(shell pwd)
 

@@ -62,12 +62,7 @@ func (z *HierarchicalZoomer) ZoomOverview(targetDomain string) map[string]any {
 			var keyModules []map[string]any
 			for _, e := range item.outgoing[:sampleLimit] {
 				if mod, ok := z.db.GetNode(e.TargetID); ok {
-					loc, _ := mod["loc"].(int)
-					if loc == 0 {
-						if locFloat, ok := mod["loc"].(float64); ok {
-							loc = int(locFloat)
-						}
-					}
+					loc := toInt(mod["loc"])
 					keyModules = append(keyModules, map[string]any{
 						"path":     mod["path"],
 						"language": mod["language"],
@@ -94,12 +89,7 @@ func (z *HierarchicalZoomer) ZoomOverview(targetDomain string) map[string]any {
 
 			for _, e := range item.outgoing[:limit] {
 				if mod, ok := z.db.GetNode(e.TargetID); ok {
-					loc, _ := mod["loc"].(int)
-					if loc == 0 {
-						if locFloat, ok := mod["loc"].(float64); ok {
-							loc = int(locFloat)
-						}
-					}
+					loc := toInt(mod["loc"])
 					docstring, _ := mod["docstring"].(string)
 					docFirstLine := ""
 					if docstring != "" {
@@ -398,6 +388,8 @@ func toInt(v any) int {
 	switch val := v.(type) {
 	case int:
 		return val
+	case int64:
+		return int(val)
 	case float64:
 		return int(val)
 	}

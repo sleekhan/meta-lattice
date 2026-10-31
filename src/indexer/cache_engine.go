@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -26,29 +27,29 @@ import (
 const CacheVersion = "1.4"
 
 var SupportedExtensions = map[string]string{
-	".py":    "python",
-	".ts":    "typescript",
-	".tsx":   "typescript",
-	".js":    "javascript",
-	".jsx":   "javascript",
+	".py":     "python",
+	".ts":     "typescript",
+	".tsx":    "typescript",
+	".js":     "javascript",
+	".jsx":    "javascript",
 	".mjs":    "javascript",
 	".cjs":    "javascript",
 	".vue":    "vue",
 	".svelte": "svelte",
 	".go":     "go",
-	".java":  "java",
-	".kt":    "kotlin",
-	".kts":   "kotlin",
-	".cs":    "csharp",
-	".swift": "swift",
-	".php":   "php",
-	".rs":    "rust",
-	".c":     "c",
-	".cpp":   "cpp",
-	".cc":    "cpp",
-	".cxx":   "cpp",
-	".h":     "c",
-	".hpp":   "cpp",
+	".java":   "java",
+	".kt":     "kotlin",
+	".kts":    "kotlin",
+	".cs":     "csharp",
+	".swift":  "swift",
+	".php":    "php",
+	".rs":     "rust",
+	".c":      "c",
+	".cpp":    "cpp",
+	".cc":     "cpp",
+	".cxx":    "cpp",
+	".h":      "c",
+	".hpp":    "cpp",
 }
 
 type CacheFileInfo struct {
@@ -66,6 +67,7 @@ type CacheState struct {
 	Version   string                   `json:"version"`
 	LastSync  int64                    `json:"last_sync"`
 	GitCommit string                   `json:"git_commit"`
+	FullSync  bool                     `json:"full_sync"`
 	Files     map[string]CacheFileInfo `json:"files"`
 }
 
@@ -78,6 +80,15 @@ type SyncStats struct {
 	CachedCount   int            `json:"cached_count"`
 	Nodes         map[string]int `json:"nodes"`
 	GitCommit     string         `json:"git_commit"`
+	Error         string         `json:"error,omitempty"`
+}
+
+// stateSignature identifies the on-disk cache state file so a long-running
+// process (e.g. the MCP server) can notice that another process such as the
+// post-tool hook rewrote it.
+type stateSignature struct {
+	modTime time.Time
+	size    int64
 }
 
 type CacheEngine struct {
@@ -85,6 +96,8 @@ type CacheEngine struct {
 	db            *storage.GraphStorage
 	workspaceRoot string
 	state         CacheState
+	stateSig      stateSignature
+	mu            sync.Mutex
 }
 
 func NewCacheEngine(cfg *config.LatticeConfig, db *storage.GraphStorage) *CacheEngine {
@@ -99,6 +112,31 @@ func NewCacheEngine(cfg *config.LatticeConfig, db *storage.GraphStorage) *CacheE
 	}
 	engine.loadCacheState()
 	return engine
+}
+
+func (e *CacheEngine) IsFullyIndexed() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.state.FullSync
+}
+
+// RefreshState reloads the persisted cache state when the state file changed
+// since it was last read or written by this engine. It reports whether a
+// reload happened. Long-running processes must call this before deciding
+// whether to sync, otherwise a targeted update performed by another process
+// (the post-tool hook) is invisible to them.
+func (e *CacheEngine) RefreshState() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	fi, err := os.Stat(e.config.CacheStateFile)
+	if err != nil {
+		return false
+	}
+	if fi.ModTime().Equal(e.stateSig.modTime) && fi.Size() == e.stateSig.size {
+		return false
+	}
+	e.loadCacheState()
+	return true
 }
 
 func (e *CacheEngine) loadCacheState() {
@@ -129,6 +167,9 @@ func (e *CacheEngine) loadCacheState() {
 	}
 
 	e.state = loaded
+	if fi, statErr := os.Stat(e.config.CacheStateFile); statErr == nil {
+		e.stateSig = stateSignature{modTime: fi.ModTime(), size: fi.Size()}
+	}
 }
 
 func (e *CacheEngine) saveCacheState() error {
@@ -143,7 +184,14 @@ func (e *CacheEngine) saveCacheState() error {
 	if err := os.WriteFile(tmpFile, data, 0644); err != nil {
 		return err
 	}
-	return os.Rename(tmpFile, e.config.CacheStateFile)
+	if err := os.Rename(tmpFile, e.config.CacheStateFile); err != nil {
+		return err
+	}
+	// Remember our own write so RefreshState does not reload it needlessly.
+	if fi, err := os.Stat(e.config.CacheStateFile); err == nil {
+		e.stateSig = stateSignature{modTime: fi.ModTime(), size: fi.Size()}
+	}
+	return nil
 }
 
 func ComputeFileSHA(filePath string) string {
@@ -196,6 +244,12 @@ func isFilePattern(pattern string) bool {
 }
 
 func (e *CacheEngine) ScanFiles() map[string]string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.scanFiles()
+}
+
+func (e *CacheEngine) scanFiles() map[string]string {
 	result := make(map[string]string)
 
 	_ = filepath.Walk(e.workspaceRoot, func(p string, info os.FileInfo, err error) error {
@@ -282,16 +336,19 @@ func (e *CacheEngine) parseFile(relPath string, absPath string, sha string) *Par
 }
 
 func (e *CacheEngine) Sync(force bool) SyncStats {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	startTime := time.Now()
-	currentFiles := e.ScanFiles()
+	currentFiles := e.scanFiles()
 	cachedFiles := e.state.Files
 	if cachedFiles == nil {
 		cachedFiles = make(map[string]CacheFileInfo)
 	}
 
-	// If the graph database is empty (deleted, corrupted or failed to load) but
-	// the cache state still claims files are indexed, every file would be
-	// reported as "unchanged" and the graph would stay empty forever.
+	// Rebuild only when the persisted graph was lost while the cache still
+	// claims indexed files. A targeted partial update (FullSync=false) must NOT
+	// force a full re-parse: the delta scan below already detects workspace
+	// drift, so re-parsing every file would only burn CPU.
 	if !force && len(cachedFiles) > 0 && e.db.CountNodesAndEdges()["total_nodes"] == 0 {
 		force = true
 	}
@@ -448,12 +505,10 @@ func (e *CacheEngine) Sync(force bool) SyncStats {
 	parseWg.Wait()
 	close(parseResults)
 
-	domainsSeen := make(map[string]bool)
 	for pr := range parseResults {
 		if pr.res != nil {
 			res := pr.res
 			domain := GetDomainFromPath(pr.rel)
-			domainsSeen[domain] = true
 
 			var nodeIDs []string
 
@@ -492,14 +547,6 @@ func (e *CacheEngine) Sync(force bool) SyncStats {
 	}
 
 	// Step 3: Ensure L0 Domain nodes
-	for rel, info := range cachedFiles {
-		d := info.Domain
-		if d == "" {
-			d = GetDomainFromPath(rel)
-		}
-		domainsSeen[d] = true
-	}
-
 	domainCounts := make(map[string]int)
 	for rel, info := range cachedFiles {
 		d := info.Domain
@@ -564,13 +611,25 @@ func (e *CacheEngine) Sync(force bool) SyncStats {
 		}
 	}
 
-	// Save cache state & DB only if there are changes or force or db is dirty
-	if len(added) > 0 || len(modified) > 0 || len(deleted) > 0 || force || e.db.IsDirty() {
+	// Persist the graph only when it actually changed; the cache state may still
+	// need to be written to restore the full-index marker after a targeted
+	// update, without rewriting the whole graph file.
+	graphChanged := len(added) > 0 || len(modified) > 0 || len(deleted) > 0 || force || e.db.IsDirty()
+	if graphChanged || !e.state.FullSync {
 		e.state.LastSync = time.Now().Unix()
 		e.state.GitCommit = e.getGitCommit()
 		e.state.Files = cachedFiles
-		_ = e.saveCacheState()
-		_ = e.db.Save()
+		if graphChanged {
+			if err := e.db.Save(); err != nil {
+				e.state.FullSync = false
+				return SyncStats{ElapsedMS: int(time.Since(startTime).Milliseconds()), Error: fmt.Sprintf("save graph database: %v", err)}
+			}
+		}
+		e.state.FullSync = true
+		if err := e.saveCacheState(); err != nil {
+			e.state.FullSync = false
+			return SyncStats{ElapsedMS: int(time.Since(startTime).Milliseconds()), Error: fmt.Sprintf("save cache state: %v", err)}
+		}
 	}
 
 	elapsedMS := int(time.Since(startTime).Milliseconds())
@@ -591,6 +650,8 @@ func (e *CacheEngine) Sync(force bool) SyncStats {
 // SyncTargetFile performs ultra-fast targeted incremental sync for a single file
 // (e.g. from Claude Code's post-tool hook), skipping full-directory scanning.
 func (e *CacheEngine) SyncTargetFile(relPath string) (SyncStats, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	startTime := time.Now()
 	cleanRel := filepath.ToSlash(filepath.Clean(relPath))
 	cleanRel = strings.TrimPrefix(cleanRel, "./")
@@ -741,19 +802,26 @@ func (e *CacheEngine) SyncTargetFile(relPath string) (SyncStats, error) {
 	e.state.LastSync = time.Now().Unix()
 	e.state.GitCommit = e.getGitCommit()
 	e.state.Files = cachedFiles
-	_ = e.saveCacheState()
-	_ = e.db.Save()
-
-	return SyncStats{
+	e.state.FullSync = false
+	stats := SyncStats{
 		ElapsedMS:     int(time.Since(startTime).Milliseconds()),
 		TotalFiles:    len(cachedFiles),
 		AddedCount:    len(added),
 		ModifiedCount: len(modified),
 		DeletedCount:  len(deleted),
 		CachedCount:   len(cachedFiles) - len(added) - len(modified),
-		Nodes:         e.db.CountNodesAndEdges(),
 		GitCommit:     e.state.GitCommit,
-	}, nil
+	}
+	if err := e.db.Save(); err != nil {
+		stats.Error = fmt.Sprintf("save graph database: %v", err)
+		return stats, fmt.Errorf("save graph database: %w", err)
+	}
+	if err := e.saveCacheState(); err != nil {
+		stats.Error = fmt.Sprintf("save cache state: %v", err)
+		return stats, fmt.Errorf("save cache state: %w", err)
+	}
+	stats.Nodes = e.db.CountNodesAndEdges()
+	return stats, nil
 }
 
 func (e *CacheEngine) resolveDeltaEdges(added, modified, deleted []string, currentFiles map[string]string, cachedFiles map[string]CacheFileInfo) {

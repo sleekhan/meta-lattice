@@ -35,6 +35,36 @@ func TestScaffoldCreatesTemplate(t *testing.T) {
 	}
 }
 
+func TestScaffoldRejectsSymlinkEscape(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(root, "external")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	cg := codegen.NewCodegen(root)
+	if _, err := cg.ScaffoldModule(codegen.ScaffoldOptions{FilePath: "external/escape.py"}); err == nil {
+		t.Fatal("expected symlink escape to be rejected")
+	}
+}
+
+func TestScaffoldCreatesValidTypeScriptImports(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := codegen.NewCodegen(dir).ScaffoldModule(codegen.ScaffoldOptions{
+		FilePath: "Card.ts",
+		Name:     "Card",
+		Imports:  []string{"vue"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "Card.ts"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `import "vue";`) || strings.Contains(string(data), "import ...") {
+		t.Fatalf("expected valid side-effect import, got:\n%s", data)
+	}
+}
+
 func TestScaffoldRefusesOverwriteAndEscape(t *testing.T) {
 	dir := t.TempDir()
 	cg := codegen.NewCodegen(dir)

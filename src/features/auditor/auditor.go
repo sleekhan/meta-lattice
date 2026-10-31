@@ -374,37 +374,38 @@ func findSimpleCycles(mg *moduleGraph, scc []string, maxCycles int) [][]string {
 		sccSet[n] = true
 	}
 
+	starts := append([]string(nil), scc...)
+	sort.Strings(starts)
 	var cycles [][]string
-	visited := make(map[string]bool)
 	var path []string
 	pathIndex := make(map[string]int)
 
-	var dfs func(curr string)
-	dfs = func(curr string) {
+	var dfs func(curr, start string)
+	dfs = func(curr, start string) {
 		if len(cycles) >= maxCycles {
 			return
 		}
 		pathIndex[curr] = len(path)
 		path = append(path, curr)
-		visited[curr] = true
 
 		for _, edge := range mg.outEdges[curr] {
 			next := edge.target
-			if !sccSet[next] {
+			if !sccSet[next] || next < start {
 				continue
 			}
-
 			if idx, onPath := pathIndex[next]; onPath {
-				// Cycle detected
-				cycle := append([]string(nil), path[idx:]...)
-				if len(cycle) >= 2 {
-					cycles = append(cycles, cycle)
+				// Only report the cycle that closes back to the DFS start node.
+				// Reporting any back-edge would emit the same cycle again from
+				// every other start node (rotated), inflating the count and
+				// consuming the maxCycles budget.
+				if next == start && len(path)-idx >= 2 {
+					cycles = append(cycles, append([]string(nil), path[idx:]...))
 					if len(cycles) >= maxCycles {
 						return
 					}
 				}
-			} else if !visited[next] {
-				dfs(next)
+			} else {
+				dfs(next, start)
 				if len(cycles) >= maxCycles {
 					return
 				}
@@ -415,14 +416,11 @@ func findSimpleCycles(mg *moduleGraph, scc []string, maxCycles int) [][]string {
 		path = path[:len(path)-1]
 	}
 
-	for _, startNode := range scc {
-		if !visited[startNode] {
-			dfs(startNode)
-			if len(cycles) >= maxCycles {
-				break
-			}
+	for _, start := range starts {
+		dfs(start, start)
+		if len(cycles) >= maxCycles {
+			break
 		}
 	}
-
 	return cycles
 }

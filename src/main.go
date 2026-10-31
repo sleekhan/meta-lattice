@@ -150,6 +150,15 @@ func runSync(args []string) {
 	}
 	stats := engine.Sync(*force)
 
+	if stats.Error != "" {
+		// A failed save must not be reported as a successful (zeroed) sync.
+		fmt.Fprintf(os.Stderr, "Error: sync failed: %s\n", stats.Error)
+		if *asJSON {
+			printJSON(stats)
+		}
+		os.Exit(1)
+	}
+
 	if *asJSON {
 		printJSON(stats)
 		return
@@ -521,10 +530,15 @@ func runApplyPlan(args []string) {
 		res["sync"] = stats
 	}
 	if err != nil {
+		if res == nil {
+			res = map[string]any{"error": err.Error(), "rollback": false}
+		}
 		if *asJSON {
 			printJSON(res)
-		} else {
+		} else if rolledBack, _ := res["rollback"].(bool); rolledBack {
 			fmt.Printf("Error: %s (rolled back)\n", res["error"])
+		} else {
+			fmt.Printf("Error: %s (no changes were applied)\n", res["error"])
 		}
 		os.Exit(1)
 	}
@@ -586,13 +600,22 @@ func runInstall(args []string) {
 	doAgy := *all || *antigravity || !specific
 
 	if doClaude {
-		_ = inst.InstallClaudeCode()
+		if err := inst.InstallClaudeCode(); err != nil {
+			fmt.Fprintf(os.Stderr, "Claude Code installation failed: %v\n", err)
+			os.Exit(1)
+		}
 	}
 	if doCodex {
-		_ = inst.InstallCodex()
+		if err := inst.InstallCodex(); err != nil {
+			fmt.Fprintf(os.Stderr, "Codex installation failed: %v\n", err)
+			os.Exit(1)
+		}
 	}
 	if doAgy {
-		_ = inst.InstallAntigravity()
+		if err := inst.InstallAntigravity(); err != nil {
+			fmt.Fprintf(os.Stderr, "Antigravity installation failed: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	fmt.Println("\n[✓] Meta-Lattice installation complete!")
@@ -653,10 +676,20 @@ func runHook(args []string) {
 		cfg, db, engine := openWorkspace(false)
 		startTime := time.Now()
 		var syncStats indexer.SyncStats
+		var syncErrText string
 		if targetFile != "" {
-			syncStats, _ = engine.SyncTargetFile(targetFile)
+			var syncErr error
+			syncStats, syncErr = engine.SyncTargetFile(targetFile)
+			if syncErr != nil {
+				syncErrText = syncErr.Error()
+			}
 		} else {
 			syncStats = engine.Sync(false)
+			syncErrText = syncStats.Error
+		}
+		if syncErrText != "" {
+			syncStats.Error = syncErrText
+			fmt.Fprintln(os.Stderr, syncErrText)
 		}
 
 		aud := auditor.NewArchitectureBoundaryAuditor(db, cfg)

@@ -54,11 +54,51 @@ func (c *Codegen) resolvePath(relPath string) (string, string, error) {
 	if abs != c.WorkspaceRoot && !strings.HasPrefix(abs, root) {
 		return "", "", fmt.Errorf("path %q escapes workspace", relPath)
 	}
+	rootReal, err := filepath.EvalSymlinks(c.WorkspaceRoot)
+	if err != nil {
+		return "", "", fmt.Errorf("resolve workspace root: %w", err)
+	}
+	// Resolve symlinks in the deepest existing ancestor too: a directory that
+	// does not exist yet would otherwise skip the check and let MkdirAll /
+	// WriteFile follow a symlink out of the workspace.
+	targetReal, err := resolveExistingPath(abs)
+	if err != nil {
+		return "", "", fmt.Errorf("resolve target path: %w", err)
+	}
+	if targetReal != rootReal && !strings.HasPrefix(targetReal, rootReal+string(os.PathSeparator)) {
+		return "", "", fmt.Errorf("path %q escapes workspace through symlink", relPath)
+	}
 	ext := strings.ToLower(filepath.Ext(rel))
 	if _, ok := indexer.SupportedExtensions[ext]; !ok {
 		return "", "", fmt.Errorf("extension %q is not an indexed source file", ext)
 	}
 	return abs, rel, nil
+}
+
+// resolveExistingPath resolves symlinks in the deepest existing ancestor of abs
+// and re-appends the not-yet-created trailing segments, so workspace
+// containment can be verified for files that do not exist yet.
+func resolveExistingPath(abs string) (string, error) {
+	existing := abs
+	var trailing []string
+	for {
+		if _, err := os.Lstat(existing); err == nil {
+			break
+		} else if !os.IsNotExist(err) {
+			return "", err
+		}
+		parent := filepath.Dir(existing)
+		if parent == existing {
+			return "", fmt.Errorf("no existing ancestor for %q", abs)
+		}
+		trailing = append([]string{filepath.Base(existing)}, trailing...)
+		existing = parent
+	}
+	resolved, err := filepath.EvalSymlinks(existing)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(append([]string{resolved}, trailing...)...), nil
 }
 
 func languageOf(rel string) string {
@@ -113,12 +153,12 @@ func (c *Codegen) ScaffoldModule(opts ScaffoldOptions) (map[string]any, error) {
 	}
 
 	return map[string]any{
-		"created":   rel,
-		"language":  lang,
-		"kind":      kind,
-		"name":      name,
-		"bytes":     len(content),
-		"guidance":  "Run `sync_index` to index the new module, then `zoom_module` to verify it.",
+		"created":  rel,
+		"language": lang,
+		"kind":     kind,
+		"name":     name,
+		"bytes":    len(content),
+		"guidance": "Run `sync_index` to index the new module, then `zoom_module` to verify it.",
 	}, nil
 }
 
@@ -201,7 +241,7 @@ func (c *Codegen) ApplyPlan(ops []PlanOperation, dryRun bool) (map[string]any, e
 			"failed":   idx,
 			"error":    fmt.Sprintf(format, args...),
 			"results":  results,
-			"rollback": true,
+			"rollback": len(undos) > 0,
 		}, fmt.Errorf(format, args...)
 	}
 
@@ -238,10 +278,11 @@ func (c *Codegen) ApplyPlan(ops []PlanOperation, dryRun bool) (map[string]any, e
 			if !p.op.ReplaceAll && count > 1 {
 				return fail(i, "operation %d: old_text matches %d times in %q (set replace_all or narrow it)", i, count, p.rel)
 			}
-			updated := strings.Replace(string(orig), p.op.OldText, p.op.NewText, -1)
-			if !p.op.ReplaceAll && count > 1 {
-				updated = strings.Replace(string(orig), p.op.OldText, p.op.NewText, 1)
+			n := -1
+			if !p.op.ReplaceAll {
+				n = 1
 			}
+			updated := strings.Replace(string(orig), p.op.OldText, p.op.NewText, n)
 			detail := fmt.Sprintf("would replace %d occurrence(s)", count)
 			if !dryRun {
 				if err := os.WriteFile(p.abs, []byte(updated), 0644); err != nil {
@@ -304,4 +345,3 @@ func (c *Codegen) ApplyPlan(ops []PlanOperation, dryRun bool) (map[string]any, e
 		}(),
 	}, nil
 }
-

@@ -337,14 +337,18 @@ func (s *MCPServer) listTools() []map[string]any {
 
 // ensureIndexed lazily builds the index the first time a query tool is used on
 // an empty graph, so tools never return misleading "not found" results just
-// because sync_index has not been called yet.
+// because sync_index has not been called yet. Callers must refresh the cache
+// state first (see callTool) so a partial sync from the hook is visible.
 func (s *MCPServer) ensureIndexed() {
-	if s.db.CountNodesAndEdges()["total_nodes"] == 0 {
+	if !s.cacheEngine.IsFullyIndexed() {
 		s.cacheEngine.Sync(false)
 	}
 }
 
 func (s *MCPServer) callTool(name string, args map[string]any) (string, error) {
+	// The hook and the CLI run in separate processes, so reload both the graph
+	// and the cache state before serving a request.
+	s.cacheEngine.RefreshState()
 	s.db.ReloadIfModified()
 
 	switch name {
