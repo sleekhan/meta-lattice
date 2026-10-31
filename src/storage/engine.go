@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 
@@ -19,12 +20,19 @@ type NodeData struct {
 
 type GraphStorage struct {
 	mu          sync.RWMutex
-	filePath    string // json backup path
-	latticePath string // native .lattice path
+	filePath    string                        // json backup path
+	latticePath string                        // native .lattice path
 	nodes       map[string]*NodeData          // nodeID -> NodeData
 	outEdges    map[string][]models.GraphEdge // sourceID -> edges
 	inEdges     map[string][]models.GraphEdge // targetID -> edges
-	bm25        *BM25Index
+	// edgeIndex holds the (source, type, target) triples that exist, so
+	// CreateEdge can decide whether an edge is new in O(1) instead of scanning
+	// the source's edge list (which is quadratic for hubs such as L0 domains).
+	edgeIndex map[string]struct{}
+	bm25      *BM25Index
+	// counts memoizes CountNodesAndEdges; any mutation invalidates it.
+	counts      map[string]int
+	countsValid bool
 	bm25Loaded  bool
 	dirty       bool
 	loadedMtime int64
@@ -53,6 +61,7 @@ func NewGraphStorage(storagePath string) *GraphStorage {
 		nodes:       make(map[string]*NodeData),
 		outEdges:    make(map[string][]models.GraphEdge),
 		inEdges:     make(map[string][]models.GraphEdge),
+		edgeIndex:   make(map[string]struct{}),
 		bm25:        NewBM25Index(),
 	}
 	if err := gs.Load(); err != nil && !os.IsNotExist(err) {
@@ -89,9 +98,11 @@ func (s *GraphStorage) Load() error {
 			s.nodes = nodes
 			s.outEdges = outEdges
 			s.inEdges = inEdges
+			s.rebuildEdgeIndexLocked()
 			s.bm25.Clear()
 			s.bm25Loaded = false
 			s.dirty = false
+			s.countsValid = false
 			s.loadedMtime = fi.ModTime().UnixNano()
 			return nil
 		}
@@ -126,6 +137,8 @@ func (s *GraphStorage) Load() error {
 		s.outEdges[e.SourceID] = append(s.outEdges[e.SourceID], e)
 		s.inEdges[e.TargetID] = append(s.inEdges[e.TargetID], e)
 	}
+	s.rebuildEdgeIndexLocked()
+	s.countsValid = false
 
 	if HasNativeLatticeDB {
 		// Loaded from fallback JSON but native LatticeDB is available:
@@ -265,11 +278,32 @@ func (s *GraphStorage) indexNodeBM25(n *NodeData) {
 	s.bm25.IndexDocument(n.ID, text)
 }
 
+// edgeKey identifies a directed, typed edge between two nodes.
+func edgeKey(sourceID, targetID, edgeType string) string {
+	return sourceID + "\x00" + edgeType + "\x00" + targetID
+}
+
+// rebuildEdgeIndexLocked re-creates the edge lookup from the edge lists.
+func (s *GraphStorage) rebuildEdgeIndexLocked() {
+	s.edgeIndex = make(map[string]struct{}, len(s.outEdges))
+	for src, list := range s.outEdges {
+		for _, e := range list {
+			s.edgeIndex[edgeKey(src, e.TargetID, e.EdgeType)] = struct{}{}
+		}
+	}
+}
+
+// markDirtyLocked records a graph mutation and invalidates derived caches.
+func (s *GraphStorage) markDirtyLocked() {
+	s.dirty = true
+	s.countsValid = false
+}
+
 func (s *GraphStorage) CreateNode(id string, labels []string, properties map[string]any) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.dirty = true
+	s.markDirtyLocked()
 	propsCopy := make(map[string]any, len(properties))
 	for k, v := range properties {
 		propsCopy[k] = v
@@ -286,6 +320,14 @@ func (s *GraphStorage) CreateNode(id string, labels []string, properties map[str
 	if s.bm25Loaded {
 		s.indexNodeBM25(node)
 	}
+}
+
+// HasNode reports whether a node with the given ID exists.
+func (s *GraphStorage) HasNode(id string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, exists := s.nodes[id]
+	return exists
 }
 
 func (s *GraphStorage) GetNode(id string) (map[string]any, bool) {
@@ -307,7 +349,7 @@ func (s *GraphStorage) DeleteNode(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.dirty = true
+	s.markDirtyLocked()
 	delete(s.nodes, id)
 	if s.bm25Loaded {
 		s.bm25.RemoveDocument(id)
@@ -316,6 +358,7 @@ func (s *GraphStorage) DeleteNode(id string) {
 	// Remove outgoing edges
 	if outList, ok := s.outEdges[id]; ok {
 		for _, e := range outList {
+			delete(s.edgeIndex, edgeKey(id, e.TargetID, e.EdgeType))
 			// Remove from target's inEdges
 			inList := s.inEdges[e.TargetID]
 			var updated []models.GraphEdge
@@ -332,6 +375,7 @@ func (s *GraphStorage) DeleteNode(id string) {
 	// Remove incoming edges
 	if inList, ok := s.inEdges[id]; ok {
 		for _, e := range inList {
+			delete(s.edgeIndex, edgeKey(e.SourceID, id, e.EdgeType))
 			// Remove from source's outEdges
 			outList := s.outEdges[e.SourceID]
 			var updated []models.GraphEdge
@@ -343,6 +387,15 @@ func (s *GraphStorage) DeleteNode(id string) {
 			s.outEdges[e.SourceID] = updated
 		}
 		delete(s.inEdges, id)
+	}
+}
+
+// DeleteNodes removes several nodes by ID. Callers that already know the node
+// IDs (for example from the cache state) should prefer this over
+// DeleteFileSubnodes, which has to scan every node in the graph.
+func (s *GraphStorage) DeleteNodes(ids []string) {
+	for _, id := range ids {
+		s.DeleteNode(id)
 	}
 }
 
@@ -367,52 +420,89 @@ func (s *GraphStorage) CreateEdge(sourceID, targetID, edgeType string, propertie
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.dirty = true
-	propsCopy := make(map[string]any)
-	for k, v := range properties {
-		propsCopy[k] = v
+	key := edgeKey(sourceID, targetID, edgeType)
+	if _, exists := s.edgeIndex[key]; exists {
+		// The edge is already present: only rewrite it when its payload really
+		// changed. Re-asserting identical edges (for example the L0 -> L1
+		// domain links) must not mark the graph dirty, otherwise every sync
+		// rewrites the whole database file.
+		changed, found := s.updateEdgeLocked(sourceID, targetID, edgeType, properties)
+		if found {
+			if changed {
+				s.markDirtyLocked()
+			}
+			return
+		}
+		delete(s.edgeIndex, key)
 	}
 
+	s.markDirtyLocked()
 	edge := models.GraphEdge{
 		SourceID:   sourceID,
 		TargetID:   targetID,
 		EdgeType:   edgeType,
-		Properties: propsCopy,
+		Properties: copyProperties(properties),
 	}
-
-	// Replace existing edge of same source, target, edgeType if exists
-	s.deleteEdgeLocked(sourceID, targetID, edgeType)
-
 	s.outEdges[sourceID] = append(s.outEdges[sourceID], edge)
 	s.inEdges[targetID] = append(s.inEdges[targetID], edge)
+	s.edgeIndex[key] = struct{}{}
 }
 
-func (s *GraphStorage) deleteEdgeLocked(sourceID, targetID, edgeType string) {
-	if outList, ok := s.outEdges[sourceID]; ok {
-		var updated []models.GraphEdge
-		for _, e := range outList {
-			if !(e.TargetID == targetID && e.EdgeType == edgeType) {
-				updated = append(updated, e)
+// updateEdgeLocked rewrites the properties of an existing edge. It reports
+// whether the edge was found and whether its properties actually changed.
+func (s *GraphStorage) updateEdgeLocked(sourceID, targetID, edgeType string, properties map[string]any) (changed, found bool) {
+	propsCopy := copyProperties(properties)
+	list, ok := s.outEdges[sourceID]
+	if !ok {
+		return false, false
+	}
+	for i := range list {
+		if list[i].TargetID != targetID || list[i].EdgeType != edgeType {
+			continue
+		}
+		if propertiesEqual(list[i].Properties, propsCopy) {
+			return false, true
+		}
+		list[i].Properties = propsCopy
+		if inList, ok := s.inEdges[targetID]; ok {
+			for j := range inList {
+				if inList[j].SourceID == sourceID && inList[j].EdgeType == edgeType {
+					inList[j].Properties = propsCopy
+					break
+				}
 			}
 		}
-		s.outEdges[sourceID] = updated
+		return true, true
 	}
-	if inList, ok := s.inEdges[targetID]; ok {
-		var updated []models.GraphEdge
-		for _, e := range inList {
-			if !(e.SourceID == sourceID && e.EdgeType == edgeType) {
-				updated = append(updated, e)
-			}
+	return false, false
+}
+
+func copyProperties(properties map[string]any) map[string]any {
+	cp := make(map[string]any, len(properties))
+	for k, v := range properties {
+		cp[k] = v
+	}
+	return cp
+}
+
+func propertiesEqual(a, b map[string]any) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, av := range a {
+		bv, ok := b[k]
+		if !ok || !reflect.DeepEqual(av, bv) {
+			return false
 		}
-		s.inEdges[targetID] = updated
 	}
+	return true
 }
 
 func (s *GraphStorage) DeleteEdgesByType(edgeTypes ...string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.dirty = true
+	s.markDirtyLocked()
 	typesSet := make(map[string]bool)
 	for _, t := range edgeTypes {
 		typesSet[t] = true
@@ -421,9 +511,11 @@ func (s *GraphStorage) DeleteEdgesByType(edgeTypes ...string) {
 	for src, list := range s.outEdges {
 		var updated []models.GraphEdge
 		for _, e := range list {
-			if !typesSet[e.EdgeType] {
-				updated = append(updated, e)
+			if typesSet[e.EdgeType] {
+				delete(s.edgeIndex, edgeKey(src, e.TargetID, e.EdgeType))
+				continue
 			}
+			updated = append(updated, e)
 		}
 		s.outEdges[src] = updated
 	}
@@ -444,7 +536,7 @@ func (s *GraphStorage) DeleteEdgesForSource(sourceID string, edgeTypes ...string
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.dirty = true
+	s.markDirtyLocked()
 	typesSet := make(map[string]bool)
 	for _, t := range edgeTypes {
 		typesSet[t] = true
@@ -454,6 +546,7 @@ func (s *GraphStorage) DeleteEdgesForSource(sourceID string, edgeTypes ...string
 		var remaining []models.GraphEdge
 		for _, e := range outList {
 			if len(typesSet) == 0 || typesSet[e.EdgeType] {
+				delete(s.edgeIndex, edgeKey(sourceID, e.TargetID, e.EdgeType))
 				inList := s.inEdges[e.TargetID]
 				var updatedIn []models.GraphEdge
 				for _, inE := range inList {
@@ -475,7 +568,7 @@ func (s *GraphStorage) DeleteEdgesForTarget(targetID string, edgeTypes ...string
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.dirty = true
+	s.markDirtyLocked()
 	typesSet := make(map[string]bool)
 	for _, t := range edgeTypes {
 		typesSet[t] = true
@@ -485,6 +578,7 @@ func (s *GraphStorage) DeleteEdgesForTarget(targetID string, edgeTypes ...string
 		var remaining []models.GraphEdge
 		for _, e := range inList {
 			if len(typesSet) == 0 || typesSet[e.EdgeType] {
+				delete(s.edgeIndex, edgeKey(e.SourceID, targetID, e.EdgeType))
 				outList := s.outEdges[e.SourceID]
 				var updatedOut []models.GraphEdge
 				for _, outE := range outList {
@@ -620,36 +714,57 @@ func (s *GraphStorage) QueryNodes(level string, domain string, limit int) []map[
 }
 
 func (s *GraphStorage) CountNodesAndEdges() map[string]int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !s.countsValid {
+		l0, l1, l2, l3 := 0, 0, 0, 0
+		for _, n := range s.nodes {
+			lvl, _ := n.Properties["level"].(string)
+			switch lvl {
+			case string(models.LevelL0):
+				l0++
+			case string(models.LevelL1):
+				l1++
+			case string(models.LevelL2):
+				l2++
+			case string(models.LevelL3):
+				l3++
+			}
+		}
+
+		totalEdges := 0
+		for _, list := range s.outEdges {
+			totalEdges += len(list)
+		}
+
+		s.counts = map[string]int{
+			"total_nodes": len(s.nodes),
+			"total_edges": totalEdges,
+			"l0_domains":  l0,
+			"l1_modules":  l1,
+			"l2_classes":  l2,
+			"l3_symbols":  l3,
+		}
+		s.countsValid = true
+	}
+
+	out := make(map[string]int, len(s.counts))
+	for k, v := range s.counts {
+		out[k] = v
+	}
+	return out
+}
+
+// RangeNodes visits every node without copying its properties. The map passed
+// to fn is owned by the graph and must only be read, and fn must not call back
+// into GraphStorage (the read lock is held for the duration of the walk).
+func (s *GraphStorage) RangeNodes(fn func(id string, props map[string]any)) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	l0, l1, l2, l3 := 0, 0, 0, 0
-	for _, n := range s.nodes {
-		lvl, _ := n.Properties["level"].(string)
-		switch lvl {
-		case string(models.LevelL0):
-			l0++
-		case string(models.LevelL1):
-			l1++
-		case string(models.LevelL2):
-			l2++
-		case string(models.LevelL3):
-			l3++
-		}
-	}
-
-	totalEdges := 0
-	for _, list := range s.outEdges {
-		totalEdges += len(list)
-	}
-
-	return map[string]int{
-		"total_nodes": len(s.nodes),
-		"total_edges": totalEdges,
-		"l0_domains":  l0,
-		"l1_modules":  l1,
-		"l2_classes":  l2,
-		"l3_symbols":  l3,
+	for id, n := range s.nodes {
+		fn(id, n.Properties)
 	}
 }
 
