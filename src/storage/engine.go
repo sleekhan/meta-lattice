@@ -171,7 +171,11 @@ func (s *GraphStorage) Load() error {
 			s.lastSaveMode = ""
 			s.lastSaveOps = 0
 			s.countsValid = false
-			s.loadedMtime = fi.ModTime().UnixNano()
+			if mtime, ok := storageMtime(s.latticePath); ok {
+				s.loadedMtime = mtime
+			} else {
+				s.loadedMtime = fi.ModTime().UnixNano()
+			}
 			return nil
 		}
 	}
@@ -239,8 +243,8 @@ func (s *GraphStorage) Save() error {
 		s.lastSaveMode, s.lastSaveOps = mode, ops
 		s.dirty = false
 		s.journal = nil
-		if fi, statErr := os.Stat(s.latticePath); statErr == nil {
-			s.loadedMtime = fi.ModTime().UnixNano()
+		if mtime, ok := storageMtime(s.latticePath); ok {
+			s.loadedMtime = mtime
 		}
 		// Clean up legacy fallback JSON file once migrated to native LatticeDB
 		if s.filePath != s.latticePath {
@@ -326,6 +330,20 @@ func (s *GraphStorage) IsDirty() bool {
 	return s.dirty
 }
 
+func storageMtime(path string) (int64, bool) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return 0, false
+	}
+	mtime := fi.ModTime().UnixNano()
+	if walFi, walErr := os.Stat(path + "-wal"); walErr == nil {
+		if walMtime := walFi.ModTime().UnixNano(); walMtime > mtime {
+			mtime = walMtime
+		}
+	}
+	return mtime, true
+}
+
 func (s *GraphStorage) ReloadIfModified() bool {
 	activePath := s.filePath
 	if HasNativeLatticeDB {
@@ -333,8 +351,8 @@ func (s *GraphStorage) ReloadIfModified() bool {
 			activePath = s.latticePath
 		}
 	}
-	fi, err := os.Stat(activePath)
-	if err != nil {
+	mtime, ok := storageMtime(activePath)
+	if !ok {
 		return false
 	}
 	s.mu.RLock()
@@ -342,7 +360,7 @@ func (s *GraphStorage) ReloadIfModified() bool {
 	isDirty := s.dirty
 	s.mu.RUnlock()
 
-	if !isDirty && fi.ModTime().UnixNano() != curMtime {
+	if !isDirty && mtime != curMtime {
 		_ = s.Load()
 		return true
 	}
@@ -693,11 +711,100 @@ func propertiesEqual(a, b map[string]any) bool {
 	}
 	for k, av := range a {
 		bv, ok := b[k]
-		if !ok || !reflect.DeepEqual(av, bv) {
+		if !ok || !propertyValueEqual(av, bv) {
 			return false
 		}
 	}
 	return true
+}
+
+// propertyValueEqual compares two property values while tolerating the type
+// conversions introduced by persistence (e.g. []string loaded back as []any, or
+// int loaded back as int64).
+func propertyValueEqual(a, b any) bool {
+	switch av := a.(type) {
+	case string:
+		bv, ok := b.(string)
+		return ok && av == bv
+	case []string:
+		switch bv := b.(type) {
+		case []string:
+			if len(av) != len(bv) {
+				return false
+			}
+			for i := range av {
+				if av[i] != bv[i] {
+					return false
+				}
+			}
+			return true
+		case []any:
+			if len(av) != len(bv) {
+				return false
+			}
+			for i := range av {
+				s, ok := bv[i].(string)
+				if !ok || av[i] != s {
+					return false
+				}
+			}
+			return true
+		}
+	case []any:
+		switch bv := b.(type) {
+		case []string:
+			if len(av) != len(bv) {
+				return false
+			}
+			for i := range av {
+				s, ok := av[i].(string)
+				if !ok || s != bv[i] {
+					return false
+				}
+			}
+			return true
+		case []any:
+			if len(av) != len(bv) {
+				return false
+			}
+			for i := range av {
+				if !propertyValueEqual(av[i], bv[i]) {
+					return false
+				}
+			}
+			return true
+		}
+	case int:
+		if bv, ok := toInt64(b); ok {
+			return int64(av) == bv
+		}
+	case int64:
+		if bv, ok := toInt64(b); ok {
+			return av == bv
+		}
+	case int32:
+		if bv, ok := toInt64(b); ok {
+			return int64(av) == bv
+		}
+	case map[string]any:
+		if bv, ok := b.(map[string]any); ok {
+			return propertiesEqual(av, bv)
+		}
+	}
+	return reflect.DeepEqual(a, b)
+}
+
+func toInt64(v any) (int64, bool) {
+	switch n := v.(type) {
+	case int:
+		return int64(n), true
+	case int64:
+		return n, true
+	case int32:
+		return int64(n), true
+	default:
+		return 0, false
+	}
 }
 
 func (s *GraphStorage) DeleteEdgesByType(edgeTypes ...string) {

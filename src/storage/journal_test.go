@@ -81,10 +81,28 @@ func TestJournalIgnoresNoOpMutations(t *testing.T) {
 		t.Fatalf("no-op deletions journaled %d operations", db.journal.ops())
 	}
 
-	// Re-asserting an identical edge is not a change either.
+	// Re-asserting an identical edge is not a change either, even when slice or
+	// integer types differ after a database load ([]any vs []string, int64 vs int).
 	db.CreateEdge("file:a.py", "file:b.py", string(models.EdgeImports), nil)
 	if db.dirty || (db.journal != nil && db.journal.ops() != 0) {
 		t.Fatal("identical edge was journaled")
+	}
+
+	db.CreateEdge("file:a.py", "file:b.py", string(models.EdgeImports), map[string]any{
+		"imported_names": []any{"helper", "util"},
+		"spec":           "./b",
+		"weight":         int64(2),
+	})
+	db.journal = nil
+	db.dirty = false
+
+	db.CreateEdge("file:a.py", "file:b.py", string(models.EdgeImports), map[string]any{
+		"imported_names": []string{"helper", "util"},
+		"spec":           "./b",
+		"weight":         2,
+	})
+	if db.dirty || (db.journal != nil && db.journal.ops() != 0) {
+		t.Fatal("re-asserted edge with equivalent []string/int properties was journaled")
 	}
 }
 
