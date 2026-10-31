@@ -19,6 +19,7 @@ func NewHierarchicalZoomer(db *storage.GraphStorage) *HierarchicalZoomer {
 
 // ZoomOverview returns L0/L1 overview of domains and module catalogs without full code bodies.
 func (z *HierarchicalZoomer) ZoomOverview(targetDomain string) map[string]any {
+	defer z.db.BeginReadSession()()
 	l0Nodes := z.db.QueryNodes(string(models.LevelL0), "", 0)
 	var domains []map[string]any
 
@@ -155,15 +156,15 @@ func (z *HierarchicalZoomer) ZoomOverview(targetDomain string) map[string]any {
 
 // ZoomModule returns L1->L2 module view: classes, methods signatures (NO method bodies), and imports.
 func (z *HierarchicalZoomer) ZoomModule(filePathOrID string) map[string]any {
-	fileID := filePathOrID
-	if !strings.HasPrefix(fileID, "file:") {
-		fileID = "file:" + filePathOrID
-	}
+	defer z.db.BeginReadSession()()
+	cleanInput := strings.ReplaceAll(filePathOrID, "\\", "/")
+	cleanPath := strings.TrimPrefix(strings.TrimPrefix(cleanInput, "file:"), "./")
+	fileID := "file:" + cleanPath
 
 	fileNode, exists := z.db.GetNode(fileID)
 	if !exists {
 		// Fuzzy match by path
-		nodes := z.db.FindNodesByLabelProperty("L1Module", "path", filePathOrID, 1)
+		nodes := z.db.FindNodesByLabelProperty("L1Module", "path", cleanPath, 1)
 		if len(nodes) > 0 {
 			fileNode = nodes[0]
 			fileID, _ = fileNode["id"].(string)
@@ -253,6 +254,10 @@ func (z *HierarchicalZoomer) ZoomModule(filePathOrID string) map[string]any {
 
 // ZoomSymbol returns L3 symbol view: full code implementation, incoming callers, outgoing calls, complexity.
 func (z *HierarchicalZoomer) ZoomSymbol(symbolNameOrID string, filePath string) map[string]any {
+	defer z.db.BeginReadSession()()
+	if filePath != "" {
+		filePath = strings.TrimPrefix(strings.ReplaceAll(filePath, "\\", "/"), "./")
+	}
 	var targetNode map[string]any
 
 	if strings.HasPrefix(symbolNameOrID, "symbol:") {
@@ -318,6 +323,7 @@ func (z *HierarchicalZoomer) ZoomSymbol(symbolNameOrID string, filePath string) 
 
 // ZoomSearch executes BM25 search across LatticeDB nodes.
 func (z *HierarchicalZoomer) ZoomSearch(query string, level string, limit int) map[string]any {
+	defer z.db.BeginReadSession()()
 	if limit <= 0 {
 		limit = 15
 	}

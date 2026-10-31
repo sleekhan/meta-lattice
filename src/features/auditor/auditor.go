@@ -2,6 +2,7 @@ package auditor
 
 import (
 	"math"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -104,8 +105,28 @@ func (a *ArchitectureBoundaryAuditor) detectLayer(filePath string, customLayer a
 	return "general"
 }
 
+func (a *ArchitectureBoundaryAuditor) normalizeTargetPath(filePath string) string {
+	if filePath == "" {
+		return ""
+	}
+	if a.config != nil && a.config.WorkspaceRoot != "" {
+		if filepath.IsAbs(filePath) {
+			if rel, err := filepath.Rel(a.config.WorkspaceRoot, filePath); err == nil && !strings.HasPrefix(rel, "..") {
+				filePath = rel
+			}
+		}
+		wsSlash := strings.TrimSuffix(strings.ReplaceAll(a.config.WorkspaceRoot, "\\", "/"), "/")
+		fpSlash := strings.ReplaceAll(filePath, "\\", "/")
+		if wsSlash != "" && strings.HasPrefix(strings.ToLower(fpSlash), strings.ToLower(wsSlash)+"/") {
+			filePath = fpSlash[len(wsSlash)+1:]
+		}
+	}
+	return strings.TrimPrefix(strings.ReplaceAll(filePath, "\\", "/"), "./")
+}
+
 // CheckLayerViolation audits architecture boundaries, circular dependencies, and coupling instability.
 func (a *ArchitectureBoundaryAuditor) CheckLayerViolation(filePath string, customRules []config.ArchRule) map[string]any {
+	defer a.db.BeginReadSession()()
 	mg := a.getModuleGraph()
 	rules := customRules
 	if len(rules) == 0 && a.config != nil && len(a.config.ArchRules.Rules) > 0 {
@@ -116,7 +137,7 @@ func (a *ArchitectureBoundaryAuditor) CheckLayerViolation(filePath string, custo
 	}
 
 	var violations []map[string]any
-	targetPath := strings.ReplaceAll(filePath, "\\", "/")
+	targetPath := a.normalizeTargetPath(filePath)
 
 	// 1. Check Layer Rule Violations
 	for src, edges := range mg.outEdges {

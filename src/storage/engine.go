@@ -157,6 +157,7 @@ func NewGraphStorage(storagePath string) *GraphStorage {
 		} else if _, statErr := os.Stat(latticePath); os.IsNotExist(statErr) {
 			corruptPath = jsonPath
 		}
+		closeCachedReadOnlyDB()
 		_ = os.Rename(corruptPath, corruptPath+".corrupt")
 	}
 	return gs
@@ -1598,6 +1599,9 @@ func (s *GraphStorage) FindSymbolsByName(name string, filePath string) []map[str
 	if name == "" {
 		return nil
 	}
+	if filePath != "" {
+		filePath = strings.TrimPrefix(strings.ReplaceAll(filePath, "\\", "/"), "./")
+	}
 	s.mu.RLock()
 	if s.lazyNative && !s.dirty {
 		latticePath := s.latticePath
@@ -1800,6 +1804,16 @@ func (s *GraphStorage) AllEdges() []models.GraphEdge {
 	return edges
 }
 
+// BeginReadSession pins the read-only native LatticeDB handle for the duration
+// of a multi-query read operation and returns a release closure. On Windows,
+// the handle is closed synchronously when the last read session ends so no OS
+// file lock lingers after the operation returns.
+func (s *GraphStorage) BeginReadSession() func() {
+	return beginReadOnlySession()
+}
+
 func (s *GraphStorage) Close() error {
-	return s.Save()
+	err := s.Save()
+	closeCachedReadOnlyDB()
+	return err
 }

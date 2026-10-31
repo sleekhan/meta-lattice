@@ -26,7 +26,7 @@ func (b *BlastRadiusEstimator) resolveTargetNodes(symbolOrPath string) []map[str
 	}
 
 	// 2. File path lookup
-	cleanPath := strings.ReplaceAll(symbolOrPath, "\\", "/")
+	cleanPath := strings.TrimPrefix(strings.ReplaceAll(symbolOrPath, "\\", "/"), "./")
 	fileID := "file:" + cleanPath
 	if fNode, ok := b.db.GetNode(fileID); ok {
 		outgoing := b.db.GetOutgoingEdges(fileID, string(models.EdgeContains))
@@ -76,6 +76,7 @@ func (b *BlastRadiusEstimator) domainOf(node map[string]any) string {
 
 // EstimateBlastRadius simulates ripple effects, breaking change risks, and top 10 impacted sites.
 func (b *BlastRadiusEstimator) EstimateBlastRadius(symbolOrPath string, changeType string, maxHops int) map[string]any {
+	defer b.db.BeginReadSession()()
 	if maxHops <= 0 {
 		maxHops = 4
 	}

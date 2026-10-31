@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -751,6 +752,7 @@ func toLatticeValue(val any) latticedb.Value {
 }
 
 func saveToLatticeDB(latticePath string, nodes map[string]*NodeData, outEdges map[string][]models.GraphEdge) error {
+	closeCachedReadOnlyDB()
 	dir := filepath.Dir(latticePath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
@@ -1047,15 +1049,49 @@ func loadLegacyCypher(db *latticedb.DB) (map[string]*NodeData, map[string][]mode
 // -----------------------------------------------------------------------------
 
 var (
-	roCacheMu    sync.Mutex
-	roCachePath  string
-	roCacheMtime int64
-	roCacheSize  int64
-	roCacheDB    *latticedb.DB
-	roCacheTimer *time.Timer
+	roCacheMu       sync.Mutex
+	roCachePath     string
+	roCacheMtime    int64
+	roCacheSize     int64
+	roCacheDB       *latticedb.DB
+	roCacheTimer    *time.Timer
+	roCacheSessions int
 )
 
 const roCacheIdleTTL = 8 * time.Millisecond
+
+func beginReadOnlySession() func() {
+	roCacheMu.Lock()
+	if roCacheTimer != nil {
+		roCacheTimer.Stop()
+		roCacheTimer = nil
+	}
+	roCacheSessions++
+	roCacheMu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			roCacheMu.Lock()
+			defer roCacheMu.Unlock()
+			if roCacheSessions > 0 {
+				roCacheSessions--
+			}
+			if roCacheSessions == 0 && roCacheDB != nil {
+				if runtime.GOOS == "windows" {
+					closeCachedReadOnlyDBLocked()
+				} else {
+					if roCacheTimer != nil {
+						roCacheTimer.Stop()
+					}
+					roCacheTimer = time.AfterFunc(roCacheIdleTTL, func() {
+						closeCachedReadOnlyDB()
+					})
+				}
+			}
+		})
+	}
+}
 
 func closeCachedReadOnlyDB() {
 	roCacheMu.Lock()
@@ -1117,11 +1153,21 @@ func withReadOnlyDB(latticePath string, cacheMB uint32, fn func(db *latticedb.DB
 	}
 
 	runErr := fn(roCacheDB)
+	if runErr != nil {
+		closeCachedReadOnlyDBLocked()
+		return runErr
+	}
 
-	roCacheTimer = time.AfterFunc(roCacheIdleTTL, func() {
-		closeCachedReadOnlyDB()
-	})
-	return runErr
+	if roCacheSessions == 0 {
+		if runtime.GOOS == "windows" {
+			closeCachedReadOnlyDBLocked()
+		} else {
+			roCacheTimer = time.AfterFunc(roCacheIdleTTL, func() {
+				closeCachedReadOnlyDB()
+			})
+		}
+	}
+	return nil
 }
 
 func hasNodeInLatticeDB(latticePath string, id string) bool {
@@ -1188,6 +1234,9 @@ func findNodesByLabelPropertyInLatticeDB(latticePath string, label string, key s
 func findSymbolsByNameInLatticeDB(latticePath string, name string, filePath string) []*NodeData {
 	if name == "" {
 		return nil
+	}
+	if filePath != "" {
+		filePath = strings.TrimPrefix(strings.ReplaceAll(filePath, "\\", "/"), "./")
 	}
 	short := shortSymbolName(name)
 	var results []*NodeData

@@ -76,3 +76,9 @@ func countNodesAndEdgesInLatticeDB(latticePath string) (map[string]int, bool) {
 func ftsSearchInLatticeDB(latticePath string, queryText string, limit int) ([]map[string]any, bool) {
 	return nil, false
 }
+
+func beginReadOnlySession() func() {
+	return func() {}
+}
+
+func closeCachedReadOnlyDB() {}

@@ -7,9 +7,10 @@ $BinPath = "$ScriptDir\meta-lattice.exe"
 if (-not (Test-Path $BinPath)) {
     Write-Host "==> Building meta-lattice.exe for Windows x86 64-bit (windows/amd64)..."
     if (Get-Command go -ErrorAction SilentlyContinue) {
+        $env:CGO_ENABLED = "0"
         $env:GOOS = "windows"
         $env:GOARCH = "amd64"
-        go build -ldflags="-s -w" -o $BinPath "$ScriptDir\src"
+        go build -tags nolattice -ldflags="-s -w" -o $BinPath "$ScriptDir\src"
     } elseif (Get-Command docker -ErrorAction SilentlyContinue) {
         Write-Host "    'go' not found; building host source inside Docker..."
         & "$ScriptDir\scripts\docker-build.sh" windows $BinPath

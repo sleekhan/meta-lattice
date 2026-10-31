@@ -339,12 +339,17 @@ func TestLazyNativeQueriesAndMutations(t *testing.T) {
 	if len(syms) != 1 {
 		t.Fatalf("FindSymbolsByName short match = %d, want 1", len(syms))
 	}
+	if symsWin := reopened.FindSymbolsByName("parseHTTP", `.\pkg\a.py`); len(symsWin) != 1 {
+		t.Fatalf("FindSymbolsByName Windows backslash path match = %d, want 1", len(symsWin))
+	}
+	endSession := reopened.BeginReadSession()
 	if len(reopened.FTSSearch("http", 5)) == 0 {
 		t.Fatal("native FTS search failed to match camelCase token 'http'")
 	}
 	if len(reopened.GetOutgoingEdges("file:pkg/a.py", string(models.EdgeContains))) != 1 {
 		t.Fatal("GetOutgoingEdges failed in lazyNative mode")
 	}
+	endSession()
 	counts := reopened.CountNodesAndEdges()
 	if counts["total_nodes"] != 3 || counts["total_edges"] != 2 {
 		t.Fatalf("CountNodesAndEdges in lazyNative mode = %v", counts)

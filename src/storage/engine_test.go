@@ -145,6 +145,9 @@ func TestFindSymbolsByNameAndSecondaryIndexes(t *testing.T) {
 	if got := db.FindSymbolsByName("login", "pkg/a.py"); len(got) != 1 {
 		t.Fatalf("expected 1 symbol matching 'login' in pkg/a.py, got %d", len(got))
 	}
+	if got := db.FindSymbolsByName("login", `.\pkg\a.py`); len(got) != 1 {
+		t.Fatalf("expected 1 symbol matching Windows path .\\pkg\\a.py, got %d", len(got))
+	}
 	if got := db.FindSymbolsByName("AuthService.login", ""); len(got) != 1 {
 		t.Fatalf("expected 1 symbol matching qualified name 'AuthService.login', got %d", len(got))
 	}
