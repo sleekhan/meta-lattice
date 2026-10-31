@@ -150,6 +150,15 @@ func runSync(args []string) {
 	}
 	stats := engine.Sync(*force)
 
+	if stats.Error != "" {
+		// A failed save must not be reported as a successful (zeroed) sync.
+		fmt.Fprintf(os.Stderr, "Error: sync failed: %s\n", stats.Error)
+		if *asJSON {
+			printJSON(stats)
+		}
+		os.Exit(1)
+	}
+
 	if *asJSON {
 		printJSON(stats)
 		return
@@ -526,8 +535,10 @@ func runApplyPlan(args []string) {
 		}
 		if *asJSON {
 			printJSON(res)
-		} else {
+		} else if rolledBack, _ := res["rollback"].(bool); rolledBack {
 			fmt.Printf("Error: %s (rolled back)\n", res["error"])
+		} else {
+			fmt.Printf("Error: %s (no changes were applied)\n", res["error"])
 		}
 		os.Exit(1)
 	}
@@ -665,21 +676,20 @@ func runHook(args []string) {
 		cfg, db, engine := openWorkspace(false)
 		startTime := time.Now()
 		var syncStats indexer.SyncStats
+		var syncErrText string
 		if targetFile != "" {
 			var syncErr error
 			syncStats, syncErr = engine.SyncTargetFile(targetFile)
 			if syncErr != nil {
-				syncStats.Error = syncErr.Error()
-				fmt.Fprintln(os.Stderr, syncErr)
+				syncErrText = syncErr.Error()
 			}
 		} else {
 			syncStats = engine.Sync(false)
-			if syncStats.Error != "" {
-				fmt.Fprintln(os.Stderr, syncStats.Error)
-			}
+			syncErrText = syncStats.Error
 		}
-		if syncStats.Error != "" {
-			fmt.Fprintln(os.Stderr, syncStats.Error)
+		if syncErrText != "" {
+			syncStats.Error = syncErrText
+			fmt.Fprintln(os.Stderr, syncErrText)
 		}
 
 		aud := auditor.NewArchitectureBoundaryAuditor(db, cfg)
