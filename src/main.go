@@ -614,12 +614,10 @@ func runHook(args []string) {
 
 	switch hookEvent {
 	case "session-start", "SessionStart":
-		_, _, engine := openWorkspace(false)
-		stats := engine.Sync(false)
 		if *asJSON {
-			printJSON(stats)
+			printJSON(map[string]string{"status": "ready", "indexing": "deferred"})
 		} else if !*quiet {
-			fmt.Printf("[✓] Meta-Lattice: Session initialized, %d files indexed (%d ms)\n", stats.TotalFiles, stats.ElapsedMS)
+			fmt.Println("[✓] Meta-Lattice: Session ready (indexing deferred until first query)")
 		}
 		return
 
