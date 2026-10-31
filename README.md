@@ -67,6 +67,7 @@ It ships official [LatticeDB](https://github.com/jeffhajewski/latticedb) v0.15.0
 ### 4. Incremental AST Indexer & Local Cache Engine
 * **SHA-256 & mtime mapping**: file hashes and mtimes are recorded in cache state (`.lattice/cache_state.json`, v1.4). A version mismatch triggers automatic full re-indexing on the next sync.
 * **Localized delta edge updates**: on file modification only the directly related dependency edges are selectively deleted and rebuilt in $O(\Delta)$ — no full-graph wipe — achieving millisecond re-syncs on tens of thousands of files.
+* **Incremental persistence**: only the nodes and edges touched since the last save are replayed into `knowledge.lattice` in a single transaction (~23–62 ms on 6k–18k node graphs). Initial or forced syncs still rebuild the file, and a lock conflict or an unindexed legacy file falls back safely instead of corrupting the graph.
 * **Automatic cross-file dependency restoration**: `IMPORTS` edges between files and optimally-scoped (same class first, same file first, imported files first) `CALLS` edges between L3 symbols.
   * **Go**: resolves package imports against `go.mod` module paths, linking `IMPORTS` edges to workspace-internal `.go` files (excluding tests). Multi-`go.mod` monorepos supported.
   * **TypeScript / JavaScript**: resolves relative/absolute imports and `tsconfig.json` path aliases (`@/*`, `~/*`) to file paths.

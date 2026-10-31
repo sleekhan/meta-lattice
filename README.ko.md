@@ -67,6 +67,7 @@
 ### 4. 증분 AST 인덱서 & 로컬 캐시 엔진 (Incremental AST Cache)
 * **SHA-256 & Mtime 매핑**: 파일 SHA-256 해시와 mtime을 캐시 상태(`.lattice/cache_state.json`, v1.4)에 기록. 캐시 버전이 다르면 다음 sync에서 자동으로 전체 재인덱싱합니다.
 * **국소적 델타 엣지 갱신 (Localized Delta Invalidation)**: 파일이 수정되었을 때 전체 그래프를 지우지 않고 변경된 파일과 직접 관련된 의존 엣지만 $O(\Delta)$로 선별 삭제 후 갱신하여 수만 개 파일 환경에서도 밀리초 단위 재동기화를 달성합니다.
+* **증분 영속화 (Incremental Persistence)**: 마지막 저장 이후 변경된 노드/엣지의 최종 상태만 저널에 기록해 두었다가 `.lattice` 파일에 단일 트랜잭션으로 재생합니다(6천~1.8만 노드 그래프 기준 약 23–62ms). 최초/강제 sync는 기존처럼 파일을 전체 재작성하며, 락 충돌이나 인덱스 미지원 파일은 안전하게 전체 재작성으로 폴백합니다.
 * **상호 파일 의존성 자동 복원**: 파일 간 `IMPORTS` 엣지와 L3 심볼 간 최적 스코프(동일 클래스 우선, 동일 파일 우선, import된 파일 우선) `CALLS` 엣지를 자동 연결.
   * **Go**: 패키지 import를 `go.mod`의 module 경로 기준으로 해석해, 워크스페이스 내부 패키지의 (테스트 파일을 제외한) `.go` 파일에 `IMPORTS` 엣지를 연결합니다. 다중 `go.mod` 모노레포도 지원합니다.
   * **TypeScript / JavaScript**: 상대/절대 import 및 `tsconfig.json` path alias(`@/*`, `~/*`)를 파일 경로로 자동 해석합니다.
