@@ -394,7 +394,11 @@ func findSimpleCycles(mg *moduleGraph, scc []string, maxCycles int) [][]string {
 				continue
 			}
 			if idx, onPath := pathIndex[next]; onPath {
-				if len(path)-idx >= 2 {
+				// Only report the cycle that closes back to the DFS start node.
+				// Reporting any back-edge would emit the same cycle again from
+				// every other start node (rotated), inflating the count and
+				// consuming the maxCycles budget.
+				if next == start && len(path)-idx >= 2 {
 					cycles = append(cycles, append([]string(nil), path[idx:]...))
 					if len(cycles) >= maxCycles {
 						return
