@@ -252,10 +252,11 @@ func (c *Codegen) ApplyPlan(ops []PlanOperation, dryRun bool) (map[string]any, e
 			if !p.op.ReplaceAll && count > 1 {
 				return fail(i, "operation %d: old_text matches %d times in %q (set replace_all or narrow it)", i, count, p.rel)
 			}
-			updated := strings.Replace(string(orig), p.op.OldText, p.op.NewText, -1)
-			if !p.op.ReplaceAll && count > 1 {
-				updated = strings.Replace(string(orig), p.op.OldText, p.op.NewText, 1)
+			n := -1
+			if !p.op.ReplaceAll {
+				n = 1
 			}
+			updated := strings.Replace(string(orig), p.op.OldText, p.op.NewText, n)
 			detail := fmt.Sprintf("would replace %d occurrence(s)", count)
 			if !dryRun {
 				if err := os.WriteFile(p.abs, []byte(updated), 0644); err != nil {

@@ -9,35 +9,44 @@ import (
 	"meta-lattice/src/storage"
 )
 
-func TestSyncCompletesPartialTargetedIndex(t *testing.T) {
+func TestSyncCompletesTargetedUpdateAfterWorkspaceDrift(t *testing.T) {
 	root := t.TempDir()
-	for name, source := range map[string]string{
-		"a.py": "def first():\n    return 1\n",
-		"b.py": "def second():\n    return 2\n",
-	} {
+	write := func(name, source string) {
+		t.Helper()
 		if err := os.WriteFile(filepath.Join(root, name), []byte(source), 0644); err != nil {
 			t.Fatal(err)
 		}
 	}
+	write("a.py", "def first():\n    return 1\n")
+	write("b.py", "def second():\n    return 2\n")
 
 	cfg := config.NewLatticeConfig(root)
 	db := storage.NewGraphStorage(cfg.DBPath)
 	engine := NewCacheEngine(cfg, db)
+	if stats := engine.Sync(false); stats.Error != "" {
+		t.Fatalf("initial full sync failed: %s", stats.Error)
+	}
+	if !engine.IsFullyIndexed() {
+		t.Fatal("initial sync should mark the index complete")
+	}
+
+	write("a.py", "def first():\n    return 10\n")
+	write("c.py", "def third():\n    return 3\n")
 	if _, err := engine.SyncTargetFile("a.py"); err != nil {
 		t.Fatal(err)
 	}
 	if engine.IsFullyIndexed() {
-		t.Fatal("targeted sync marked the workspace fully indexed")
+		t.Fatal("targeted sync should invalidate the full-index marker")
 	}
 
 	stats := engine.Sync(false)
 	if stats.Error != "" {
-		t.Fatalf("full sync failed: %s", stats.Error)
+		t.Fatalf("follow-up full sync failed: %s", stats.Error)
 	}
 	if !engine.IsFullyIndexed() {
-		t.Fatal("full sync did not mark workspace fully indexed")
+		t.Fatal("follow-up sync should restore the full-index marker")
 	}
-	if _, ok := db.GetNode("file:b.py"); !ok {
-		t.Fatal("full sync did not index untouched file")
+	if _, ok := db.GetNode("file:c.py"); !ok {
+		t.Fatal("follow-up full sync did not index the unedited file")
 	}
 }

@@ -586,6 +586,7 @@ func (e *CacheEngine) Sync(force bool) SyncStats {
 		e.state.GitCommit = e.getGitCommit()
 		e.state.Files = cachedFiles
 		if err := e.db.Save(); err != nil {
+			e.state.FullSync = false
 			return SyncStats{ElapsedMS: int(time.Since(startTime).Milliseconds()), Error: fmt.Sprintf("save graph database: %v", err)}
 		}
 		e.state.FullSync = true
@@ -765,8 +766,13 @@ func (e *CacheEngine) SyncTargetFile(relPath string) (SyncStats, error) {
 	e.state.LastSync = time.Now().Unix()
 	e.state.GitCommit = e.getGitCommit()
 	e.state.Files = cachedFiles
-	_ = e.saveCacheState()
-	_ = e.db.Save()
+	e.state.FullSync = false
+	if err := e.db.Save(); err != nil {
+		return SyncStats{}, fmt.Errorf("save graph database: %w", err)
+	}
+	if err := e.saveCacheState(); err != nil {
+		return SyncStats{}, fmt.Errorf("save cache state: %w", err)
+	}
 
 	return SyncStats{
 		ElapsedMS:     int(time.Since(startTime).Milliseconds()),
