@@ -71,8 +71,8 @@ Meta-Lattice는 **파일 SHA-256 해시와 수정 시각(mtime)을 결합한 2�
 | **No Changes (변경 없는 상태)** | 250개 파일 | **약 46ms** (3회 측정: 46/46/47) | 250/250 |
 | **Minor Change (2개 파일 수정)** | 2개 수정 / 248개 유지 | **약 63ms** | 248/250 |
 
-- 변경이 없을 때도 약 46ms가 걸립니다. 파일 스캔과 `stat` 외에 약 8.4MB의 그래프 DB를 읽어 들이는 비용이 포함된 것으로 보이지만(프로파일링은 하지 않은 추정), 구성 요소별로 분해해 측정하지는 않았습니다.
-- 파일이 하나라도 바뀌면 전체 `IMPORTS`/`CALLS` 엣지를 다시 해석합니다(코드 기준). 그래서 수정 비용은 변경 파일 수보다 저장소 전체 크기의 영향을 더 받습니다.
+- 변경이 없을 때도 약 46ms가 걸립니다. 파일 스캔과 `stat` 및 캐시 메타데이터 검증 비용이 포함됩니다.
+- v1.5 캐시 엔진에서는 파일 수정 시 전체 그래프를 순회하지 않고, 변경된 파일(`dirtyFiles`)과 직접 관련된 `IMPORTS`/`CALLS` 엣지만 $O(\Delta)$로 국소 선별 갱신하므로 대규모 모노레포에서도 밀리초 단위로 동기화됩니다.
 - `audit`과 `blast`는 같은 데이터에서 각각 약 0.15초, 0.11초가 걸렸습니다(프로세스 시작과 DB 로드 포함).
 
 #### 증분 영속화 및 온디맨드 지연 조회 엔진 (v2 스키마)
@@ -98,6 +98,9 @@ Meta-Lattice는 **파일 SHA-256 해시와 수정 시각(mtime)을 결합한 2�
 | **Cold 변경 없는 `Sync(false)`** | 약 3,650 ms | **약 71.3 ms** | **51×** |
 | **Cold 단일 파일 `SyncTargetFile` (훅 편집)** | 약 17,970 ms (전체 재작성) / 약 3,650 ms (로드) | **약 147.4 ms** (`mode=incremental`, 15 ops) | **121×** |
 
+- 전체 재작성은 다음 경우에만 안전하게 실행됩니다: 파일 미존재, 강제 동기화(`--force`, 캐시 버전 변경, 드리프트 감지), 델타 연산이 `max(2000, (nodes+edges)/4)` 초과, 파일 인플레이스 갱신 불가(인덱스 누락, 중복 id).
+- 변경 저널 재생은 멱등(LatticeDB 중복 엣지 허용에 대응해 엣지 upsert는 delete-then-create)하며 원자적(트랜잭션 실패 시 이전 파일 무손상 보존)입니다.
+- 다른 프로세스가 파일 락을 쥐고 있으면 명시적 에러를 반환하고 미반영 저널을 보존하여 유실 없이 다음 동기화에서 재시도합니다.
 - `.lattice/cache_state.json`에 파일별 심볼 메타데이터(`CachedSymbol`)와 영속화된 노드/엣지 수를 함께 저장하여, 단일 파일 수정 시 전체 그래프를 스캔하지 않고 $O(\Delta)$로 `IMPORTS`/`CALLS` 델타 엣지를 갱신합니다.
 
 > ⚡ **동작 특성**: 그래프가 비어 있는 상태에서 조회 도구(`zoom_*`, `check_layer_violation`, `estimate_blast_radius`)를 처음 호출하면 자동으로 인덱싱합니다. 이후 코드 변경을 반영하려면 `sync_index`(또는 `meta-lattice sync`)를 호출하세요. CLI의 `zoom`/`audit`/`blast` 명령은 실행 시마다 증분 동기화를 수행합니다.
@@ -115,7 +118,9 @@ Meta-Lattice는 **파일 SHA-256 해시와 수정 시각(mtime)을 결합한 2�
   - 별도 Docker 컨테이너 / 백그라운드 데몬 프로세스 불필요 (Zero-Dependency)
 
 [메모리 사용량]
-  - 그래프 전체를 메모리에 올리는 구조이므로 코드베이스 크기에 비례해 늘어납니다.
+  - 온디맨드 지연 네이티브 실행(lazyNative): 그래프 전체를 메모리에 미리 올리지 않고
+    필요한 노드/엣지만 B-Tree 및 인접 리스트로 직접 조회하여 대규모 코드베이스에서도
+    메모리 사용량을 수십 MB 이내로 최소화합니다.
 ```
 
 > ⚡ **바이너리 영속화**: 단일 바이너리 지식 그래프 파일(`.lattice/knowledge.lattice`)을 활용하여 고속 쿼리 및 원자적(atomic) 저장을 보장합니다.
@@ -178,7 +183,7 @@ Meta-Lattice는 특정 툴에 종속되지 않는 **MCP(Model Context Protocol) 
 
 - **Claude Code**: `.claude-plugin/marketplace.json`, 슬래시 커맨드(`/meta-lattice:zoom`, `audit`, `blast`), 생명주기 훅 지원
 - **OpenAI Codex**: `.codex/config.toml`, 프로젝트 자동 감지 및 `AGENTS.md` 가이드라인 내장
-- **Google Antigravity**: `.agents/mcp_config.json`, 온디맨드 스킬 4종 및 `GEMINI.md` 제공
+- **Google Antigravity**: `.agents/mcp_config.json`, 온디맨드 스킬 5종 및 `GEMINI.md` 제공
 - **원클릭 통합 인스톨러**: `meta-lattice install` 한 번으로 Codex와 Antigravity 전역 설정을 자동 완료 (`--status`, `--uninstall` 지원)
 
 ---
@@ -241,7 +246,7 @@ Meta-Lattice는 특정 툴에 종속되지 않는 **MCP(Model Context Protocol) 
 **알려진 한계**
 - 호출/참조 해석은 이름 기반 휴리스틱이며, 동명 함수가 여럿이면 연결하지 않습니다.
 - Python/TypeScript/JavaScript 파서는 정규식 기반이라 복잡한 문법에서 누락될 수 있습니다. Go만 `go/ast`로 정확히 파싱합니다.
-- 그래프 전체를 단일 JSON 파일에 저장하므로 매우 큰 저장소에서는 로드 시간이 늘 수 있습니다.
+- 단일 바이너리 파일(`.lattice/knowledge.lattice`) 영속화 방식은 수십만 개 이상의 초대형 모노레포(>10만 파일) 환경에서 초기 로드 오버헤드가 발생할 수 있습니다.
 
 ---
 

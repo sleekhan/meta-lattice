@@ -347,6 +347,7 @@ Register in the project root's [`.agents/mcp_config.json`](file:///.agents/mcp_c
    - [`.agents/skills/architecture-auditor/SKILL.md`](file:///.agents/skills/architecture-auditor/SKILL.md): unidirectional layer & cycle audit workflow
    - [`.agents/skills/blast-radius/SKILL.md`](file:///.agents/skills/blast-radius/SKILL.md): pre-refactor blast-radius simulation workflow
    - [`.agents/skills/incremental-cache/SKILL.md`](file:///.agents/skills/incremental-cache/SKILL.md): AST incremental-cache refresh workflow
+   - [`.agents/skills/codegen/SKILL.md`](file:///.agents/skills/codegen/SKILL.md): language template scaffolding & safe batched edit plan workflow
 2. **Agent rulebook (`GEMINI.md`)**:
    - The project root [`GEMINI.md`](file:///GEMINI.md) defines the operating rules Antigravity agents must follow during coding work.
 3. **Auto hooks (`hooks/hooks.json`)**:

@@ -347,6 +347,7 @@ Google Antigravity(IDE 및 CLI) 환경에서는 MCP 서버 연동과 더불어 *
    - [`.agents/skills/architecture-auditor/SKILL.md`](file:///.agents/skills/architecture-auditor/SKILL.md): 단방향 계층 및 순환 참조 감사 워크플로우
    - [`.agents/skills/blast-radius/SKILL.md`](file:///.agents/skills/blast-radius/SKILL.md): 리팩터링 전 파급 반경 시뮬레이션 워크플로우
    - [`.agents/skills/incremental-cache/SKILL.md`](file:///.agents/skills/incremental-cache/SKILL.md): AST 증분 캐시 최신화 워크플로우
+   - [`.agents/skills/codegen/SKILL.md`](file:///.agents/skills/codegen/SKILL.md): 언어별 템플릿 신규 모듈 생성 및 안전한 다중 파일 배치 편집 워크플로우
 2. **에이전트 규칙 룰북 (`GEMINI.md`)**:
    - 프로젝트 루트의 [`GEMINI.md`](file:///GEMINI.md)에 Antigravity 에이전트가 코딩 작업 시 반드시 준수해야 하는 운영 지침이 정의되어 있습니다.
 3. **자동 훅 연동 (`hooks/hooks.json`)**:
