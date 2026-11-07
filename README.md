@@ -399,6 +399,15 @@ Register in the project root's [`.agents/mcp_config.json`](file:///.agents/mcp_c
 ./meta-lattice apply-plan --file plan.json            # dry-run validation (writes nothing)
 ./meta-lattice apply-plan --file plan.json --execute  # apply for real (rolls back on failure)
 
+# 5c. Multi-hop call chain tracing & Git diff change impact (NEW)
+./meta-lattice trace NewMCPServer --depth 3           # Outbound/inbound call chain tree
+./meta-lattice trace NewMCPServer --target GetConfig  # Point-to-point shortest call path
+./meta-lattice detect-changes --scope tests           # Map git diff to affected symbols & test targets
+./meta-lattice query --dead-code                      # Structural query for unused functions (in-degree = 0)
+./meta-lattice routes --path /api/v1/users            # API Route discovery (Gin, Express, FastAPI, Spring, Next.js)
+./meta-lattice communities                            # Louvain community detection (topological clusters & drift)
+./meta-lattice adr list                               # Manage Architecture Decision Records (ADRs)
+
 # 6. Run the MCP server (stdio)
 ./meta-lattice mcp
 
@@ -431,6 +440,12 @@ Register in the project root's [`.agents/mcp_config.json`](file:///.agents/mcp_c
 | `get_index_status` | none | Node/edge counts and cache statistics |
 | `scaffold_module` | `file_path: string, kind?: string, name?: string, namespace?: string, imports?: string[], overwrite?: bool` | Code generation: new source file from a language template (workspace-confined, no overwrite by default) |
 | `apply_plan` | `operations: array, dry_run?: bool` | Code generation: batched file edits (`create_file`, `replace_text`, `insert_after`, `delete_file`) with dry-run validation and automatic rollback |
+| `trace_call_path` | `source: string, target?: string, direction?: string, max_depth?: int` | Multi-hop call execution path tracing or tree exploration between symbols |
+| `detect_changes` | `base_ref?: string, scope?: string, max_hops?: int` | Map git diff to affected symbols, blast score, and affected test suites |
+| `query_graph` | `level?: string, kind?: string, min_complexity?: int, min_in_degree?: int, max_in_degree?: int, ...` | Structural code graph query (dead code, hotspots, complex methods, visibility) |
+| `manage_adr` | `action: string, id?: string, title?: string, status?: string, ...` | Architecture Decision Record manager: create, get, list, update, delete |
+| `list_routes` | `path_pattern?: string, method?: string` | API route discovery: find HTTP routes, methods, frameworks, and backing handlers |
+| `detect_communities` | `min_size?: int` | Louvain community detection: discover cohesive clusters, modularity Q, and boundary drift |
 
 ---
 

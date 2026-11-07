@@ -16,14 +16,14 @@ import (
 	"time"
 
 	"meta-lattice/src/config"
+	"meta-lattice/src/features/routes"
 	"meta-lattice/src/models"
 	"meta-lattice/src/storage"
 )
 
 // CacheVersion is bumped whenever parsing/edge-resolution semantics change so
-// that stale caches are re-indexed automatically. 1.4: Additional language
-// support (Kotlin, C#, Swift, PHP) with dotted/backslash import resolution.
-const CacheVersion = "1.4"
+// that stale caches are re-indexed automatically. 1.6: Comment-safe route indexing & cross-file handler resolution.
+const CacheVersion = "1.6"
 
 var SupportedExtensions = map[string]string{
 	".py":     "python",
@@ -597,11 +597,12 @@ func (e *CacheEngine) Sync(force bool) SyncStats {
 		absPath string
 	}
 	type parseJobResult struct {
-		rel   string
-		sha   string
-		mtime int64
-		size  int64
-		res   *ParsedFileResult
+		rel    string
+		sha    string
+		mtime  int64
+		size   int64
+		res    *ParsedFileResult
+		routes []routes.RouteEndpoint
 	}
 
 	parseJobs := make(chan parseJob, len(filesToParse))
@@ -626,12 +627,14 @@ func (e *CacheEngine) Sync(force bool) SyncStats {
 					size = fi.Size()
 				}
 				parsed := e.parseFileData(job.rel, job.absPath, data, sha)
+				fileRoutes := routes.ExtractRoutesFromFile(job.rel, string(data))
 				parseResults <- parseJobResult{
-					rel:   job.rel,
-					sha:   sha,
-					mtime: mtime,
-					size:  size,
-					res:   parsed,
+					rel:    job.rel,
+					sha:    sha,
+					mtime:  mtime,
+					size:   size,
+					res:    parsed,
+					routes: fileRoutes,
 				}
 			}
 		}()
@@ -644,6 +647,7 @@ func (e *CacheEngine) Sync(force bool) SyncStats {
 	parseWg.Wait()
 	close(parseResults)
 
+	var pendingRoutes []routes.RouteEndpoint
 	for pr := range parseResults {
 		if pr.res != nil {
 			res := pr.res
@@ -678,6 +682,15 @@ func (e *CacheEngine) Sync(force bool) SyncStats {
 				})
 			}
 
+			if len(pr.routes) > 0 {
+				for _, rt := range pr.routes {
+					if rt.ID != "" {
+						nodeIDs = append(nodeIDs, rt.ID)
+					}
+				}
+				pendingRoutes = append(pendingRoutes, pr.routes...)
+			}
+
 			cachedFiles[pr.rel] = CacheFileInfo{
 				SHA:            pr.sha,
 				Mtime:          pr.mtime,
@@ -691,6 +704,11 @@ func (e *CacheEngine) Sync(force bool) SyncStats {
 				SymbolsIndexed: true,
 			}
 		}
+	}
+
+	if len(pendingRoutes) > 0 {
+		rm := routes.NewRouteManager(e.db)
+		rm.IndexRoutes(pendingRoutes)
 	}
 
 	// Step 3: Ensure L0 Domain nodes
@@ -710,15 +728,26 @@ func (e *CacheEngine) Sync(force bool) SyncStats {
 	}
 
 	// A forced re-index is the point where the graph and the cache state may
-	// have drifted apart, so drop L0 nodes that no longer own any file.
+	// have drifted apart, so drop any orphaned nodes that no longer belong to
+	// any active domain or indexed file.
 	if force {
-		var stale []string
-		for _, props := range e.db.QueryNodes(string(models.LevelL0), "", 0) {
-			id, _ := props["id"].(string)
-			if name, _ := props["name"].(string); domainCounts[name] == 0 && id != "" {
-				stale = append(stale, id)
+		validNodes := make(map[string]bool)
+		for dom, cnt := range domainCounts {
+			if cnt > 0 {
+				validNodes["domain:"+dom] = true
 			}
 		}
+		for _, info := range cachedFiles {
+			for _, nid := range info.NodeIDs {
+				validNodes[nid] = true
+			}
+		}
+		var stale []string
+		e.db.RangeNodes(func(id string, _ map[string]any) {
+			if !validNodes[id] {
+				stale = append(stale, id)
+			}
+		})
 		e.db.DeleteNodes(stale)
 	}
 
@@ -962,6 +991,13 @@ func (e *CacheEngine) SyncTargetFile(target string) (SyncStats, error) {
 					Name:  sym.Name,
 					Calls: sym.Calls,
 				})
+			}
+
+			fileRoutes := routes.ExtractRoutesFromFile(rel, string(data))
+			if len(fileRoutes) > 0 {
+				rm := routes.NewRouteManager(e.db)
+				routeIDs := rm.IndexRoutes(fileRoutes)
+				nodeIDs = append(nodeIDs, routeIDs...)
 			}
 
 			// L0 Domain nodes are refreshed after the loop: their module_count

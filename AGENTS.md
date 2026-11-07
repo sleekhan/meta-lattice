@@ -16,6 +16,12 @@ The `meta-lattice` MCP server is enabled in `.codex/config.toml` (running `./met
 8. **`get_index_status()`**: Inspects graph statistics (L0, L1, L2, L3 counts).
 9. **`scaffold_module(file_path, kind, name=None)`**: Creates a new source file from a language template. Workspace-confined, no overwrite by default.
 10. **`apply_plan(operations, dry_run=True)`**: Applies batched file edits with validation and automatic rollback. ALWAYS dry_run first for multi-file edits.
+11. **`trace_call_path(source, target=None, direction="outbound", max_depth=3)`**: Traces multi-hop call execution chains between functions or explores caller/callee trees without method bodies.
+12. **`detect_changes(base_ref=None, scope="all", max_hops=3)`**: Maps uncommitted Git diff or branch changes to touched symbols, blast radius, and affected test suites to run.
+13. **`query_graph(level=None, kind=None, min_complexity=0, min_in_degree=None, max_in_degree=None, ...)`**: Structural query engine to find hotspots, dead code (`max_in_degree=0`), high complexity, or public symbols.
+14. **`manage_adr(action="list|get|create|update|delete", ...)`**: Persists and manages Architecture Decision Records across agent sessions.
+15. **`list_routes(path_pattern=None, method=None)`**: Discovers indexed HTTP/API endpoints, methods, and backing handler implementations.
+16. **`detect_communities(min_size=2)`**: Louvain community detection to discover cohesive functional modules, modularity $Q$, and boundary drift.
 
 ## 🧭 Operating Rules for Codex
 
@@ -23,11 +29,14 @@ The `meta-lattice` MCP server is enabled in `.codex/config.toml` (running `./met
    - When exploring unfamiliar parts of the codebase, never read multiple full files at once.
    - First call `zoom_overview()` or `zoom_search(query)`.
    - Then call `zoom_module(file_path)` to check interfaces.
+   - Use `trace_call_path(...)` to inspect deep multi-hop calling relationships without expanding code bodies.
    - Only call `zoom_symbol(symbol_name)` for the specific function(s) being debugged or modified.
 
 2. **Architectural Guardrails**:
    - Before completing any multi-file edits or refactorings, execute `check_layer_violation()`.
+   - Check `manage_adr(action="list")` to follow existing architectural constraints and decisions.
    - If circular dependencies or forbidden layer imports are detected, resolve them immediately.
 
-3. **Breaking Change Safety**:
+3. **Breaking Change Safety & Test Scoping**:
    - When modifying function signatures, interfaces, or shared utilities, run `estimate_blast_radius(...)` first to inspect the Top 10 affected call sites.
+   - After editing files, call `detect_changes(scope="tests")` to identify the exact test targets that must be run to verify changes.

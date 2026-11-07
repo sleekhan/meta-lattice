@@ -10,9 +10,15 @@ import (
 	"sync"
 
 	"meta-lattice/src/config"
+	"meta-lattice/src/features/adr"
 	"meta-lattice/src/features/auditor"
 	"meta-lattice/src/features/blast"
 	"meta-lattice/src/features/codegen"
+	"meta-lattice/src/features/community"
+	"meta-lattice/src/features/diff"
+	"meta-lattice/src/features/query"
+	"meta-lattice/src/features/routes"
+	"meta-lattice/src/features/tracer"
 	"meta-lattice/src/features/zoomer"
 	"meta-lattice/src/indexer"
 	"meta-lattice/src/storage"
@@ -39,14 +45,20 @@ type JSONRPCError struct {
 }
 
 type MCPServer struct {
-	mu          sync.Mutex
-	cfg         *config.LatticeConfig
-	db          *storage.GraphStorage
-	cacheEngine *indexer.CacheEngine
-	zoomer      *zoomer.HierarchicalZoomer
-	auditor     *auditor.ArchitectureBoundaryAuditor
-	blast       *blast.BlastRadiusEstimator
-	codegen     *codegen.Codegen
+	mu           sync.Mutex
+	cfg          *config.LatticeConfig
+	db           *storage.GraphStorage
+	cacheEngine  *indexer.CacheEngine
+	zoomer       *zoomer.HierarchicalZoomer
+	auditor      *auditor.ArchitectureBoundaryAuditor
+	blast        *blast.BlastRadiusEstimator
+	codegen      *codegen.Codegen
+	tracer       *tracer.CallTracer
+	diff         *diff.ChangeDetector
+	queryEng     *query.GraphQueryEngine
+	adrMgr       *adr.ADRManager
+	routesMgr    *routes.RouteManager
+	commDetector *community.CommunityDetector
 }
 
 func NewMCPServer(workspaceRoot string) *MCPServer {
@@ -57,15 +69,27 @@ func NewMCPServer(workspaceRoot string) *MCPServer {
 	aud := auditor.NewArchitectureBoundaryAuditor(db, cfg)
 	bl := blast.NewBlastRadiusEstimator(db)
 	cg := codegen.NewCodegen(cfg.WorkspaceRoot)
+	tr := tracer.NewCallTracer(db)
+	cd := diff.NewChangeDetector(cfg, db)
+	qe := query.NewGraphQueryEngine(db)
+	am := adr.NewADRManager(cfg)
+	rm := routes.NewRouteManager(db)
+	comm := community.NewCommunityDetector(db)
 
 	return &MCPServer{
-		cfg:         cfg,
-		db:          db,
-		cacheEngine: cacheEngine,
-		zoomer:      z,
-		auditor:     aud,
-		blast:       bl,
-		codegen:     cg,
+		cfg:          cfg,
+		db:           db,
+		cacheEngine:  cacheEngine,
+		zoomer:       z,
+		auditor:      aud,
+		blast:        bl,
+		codegen:      cg,
+		tracer:       tr,
+		diff:         cd,
+		queryEng:     qe,
+		adrMgr:       am,
+		routesMgr:    rm,
+		commDetector: comm,
 	}
 }
 
@@ -332,6 +356,94 @@ func (s *MCPServer) listTools() []map[string]any {
 				"required": []string{"operations"},
 			},
 		},
+		{
+			"name":        "trace_call_path",
+			"description": "Call Chain Tracer: Traces multi-hop execution call chains between symbols or explores inbound/outbound call trees without loading source code bodies.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"source":    map[string]any{"type": "string", "description": "Source symbol name, node ID, or file path"},
+					"target":    map[string]any{"type": "string", "description": "Optional destination symbol to find connecting call paths to"},
+					"direction": map[string]any{"type": "string", "description": "outbound (callees), inbound (callers), or both (default: outbound)"},
+					"max_depth": map[string]any{"type": "integer", "description": "Max hop depth (default: 3, max: 10)"},
+				},
+				"required": []string{"source"},
+			},
+		},
+		{
+			"name":        "detect_changes",
+			"description": "Change Impact & Test Scoper: Analyzes uncommitted git changes or branch diffs against the AST graph, mapping touched line ranges to affected symbols, blast scores, and affected test suites.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"base_ref": map[string]any{"type": "string", "description": "Git base revision (default: HEAD for uncommitted diff, or e.g. 'main')"},
+					"scope":    map[string]any{"type": "string", "description": "Scope: 'all' (symbols + tests) or 'tests' (test execution focus)"},
+					"max_hops": map[string]any{"type": "integer", "description": "Max ripple traversal hops (default: 3)"},
+				},
+			},
+		},
+		{
+			"name":        "query_graph",
+			"description": "Structural Code Graph Query: Filter codebase elements by complexity, in/out degrees (dead code, entry points, hotspots), kinds, and path patterns.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"level":          map[string]any{"type": "string", "description": "Filter by level: L0, L1, L2, L3"},
+					"kind":           map[string]any{"type": "string", "description": "Filter by kind: function, method, class, interface, struct"},
+					"name_pattern":   map[string]any{"type": "string", "description": "Substring or regex on symbol name"},
+					"file_pattern":   map[string]any{"type": "string", "description": "Substring or glob on file path"},
+					"min_complexity": map[string]any{"type": "integer", "description": "Minimum cyclomatic complexity"},
+					"max_complexity": map[string]any{"type": "integer", "description": "Maximum cyclomatic complexity"},
+					"min_in_degree":  map[string]any{"type": "integer", "description": "Minimum incoming calls/imports (hotspots)"},
+					"max_in_degree":  map[string]any{"type": "integer", "description": "Maximum incoming calls/imports (0 = dead code / entry points)"},
+					"min_out_degree": map[string]any{"type": "integer", "description": "Minimum outgoing calls/dependencies"},
+					"max_out_degree": map[string]any{"type": "integer", "description": "Maximum outgoing calls/dependencies"},
+					"is_public":      map[string]any{"type": "boolean", "description": "Filter by export / public visibility"},
+					"sort_by":        map[string]any{"type": "string", "description": "Sort order: complexity, hotspot, in_degree, out_degree, name"},
+					"limit":          map[string]any{"type": "integer", "description": "Max results (default: 25, max: 100)"},
+				},
+			},
+		},
+		{
+			"name":        "manage_adr",
+			"description": "Architecture Decision Record (ADR) Manager: Create, read, list, update, and manage persistent architectural decisions, technical constraints, and rationale across agent sessions.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"action":        map[string]any{"type": "string", "description": "Action: list, get, create, update, delete"},
+					"id":            map[string]any{"type": "string", "description": "ADR identifier (e.g. 'ADR-0001' or '1')"},
+					"title":         map[string]any{"type": "string", "description": "ADR title (for create/update)"},
+					"status":        map[string]any{"type": "string", "description": "ADR status: proposed, accepted, deprecated, superseded"},
+					"context":       map[string]any{"type": "string", "description": "Context and problem statement"},
+					"decision":      map[string]any{"type": "string", "description": "Chosen architecture decision"},
+					"consequences":  map[string]any{"type": "string", "description": "Tradeoffs and consequences"},
+					"tags":          map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Category tags"},
+					"superseded_by": map[string]any{"type": "string", "description": "Identifier of superseding ADR"},
+				},
+				"required": []string{"action"},
+			},
+		},
+		{
+			"name":        "list_routes",
+			"description": "API Route Discovery: Inspect and search indexed HTTP/API endpoints, their methods, frameworks, and backing implementation handler symbols.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"path_pattern": map[string]any{"type": "string", "description": "Substring pattern to match on route path (e.g. '/api/users')"},
+					"method":       map[string]any{"type": "string", "description": "HTTP method filter: GET, POST, PUT, DELETE, PATCH, or ALL"},
+				},
+			},
+		},
+		{
+			"name":        "detect_communities",
+			"description": "Louvain Community Detection: Discovers functional code clusters, cohesion scores, and architecture boundary drift using graph topology analysis.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"min_size": map[string]any{"type": "integer", "description": "Minimum community size in modules (default: 2)"},
+				},
+			},
+		},
 	}
 }
 
@@ -352,7 +464,7 @@ func (s *MCPServer) callTool(name string, args map[string]any) (string, error) {
 	s.db.ReloadIfModified()
 
 	switch name {
-	case "zoom_module", "zoom_symbol", "zoom_search", "check_layer_violation", "estimate_blast_radius":
+	case "zoom_module", "zoom_symbol", "zoom_search", "check_layer_violation", "estimate_blast_radius", "trace_call_path", "detect_changes", "query_graph", "list_routes", "detect_communities":
 		s.ensureIndexed()
 	}
 
@@ -491,6 +603,189 @@ func (s *MCPServer) callTool(name string, args map[string]any) (string, error) {
 			stats := s.cacheEngine.Sync(false)
 			res["sync"] = stats
 		}
+		data, err := json.MarshalIndent(res, "", "  ")
+		return string(data), err
+
+	case "trace_call_path":
+		src, _ := args["source"].(string)
+		tgt, _ := args["target"].(string)
+		dir, _ := args["direction"].(string)
+		maxDepth := 3
+		if md, ok := args["max_depth"].(float64); ok {
+			maxDepth = int(md)
+		}
+		res := s.tracer.TraceCallPath(src, tgt, dir, maxDepth)
+		data, err := json.MarshalIndent(res, "", "  ")
+		return string(data), err
+
+	case "detect_changes":
+		baseRef, _ := args["base_ref"].(string)
+		scope, _ := args["scope"].(string)
+		maxHops := 3
+		if mh, ok := args["max_hops"].(float64); ok {
+			maxHops = int(mh)
+		}
+		res := s.diff.DetectChanges(baseRef, scope, maxHops, "")
+		data, err := json.MarshalIndent(res, "", "  ")
+		return string(data), err
+
+	case "query_graph":
+		opts := query.GraphQueryOptions{}
+		if lvl, ok := args["level"].(string); ok {
+			opts.Level = lvl
+		}
+		if kind, ok := args["kind"].(string); ok {
+			opts.Kind = kind
+		}
+		if np, ok := args["name_pattern"].(string); ok {
+			opts.NamePattern = np
+		}
+		if fp, ok := args["file_pattern"].(string); ok {
+			opts.FilePattern = fp
+		}
+		if mc, ok := args["min_complexity"].(float64); ok {
+			opts.MinComplexity = int(mc)
+		}
+		if mc, ok := args["max_complexity"].(float64); ok {
+			opts.MaxComplexity = int(mc)
+		}
+		if minIn, ok := args["min_in_degree"].(float64); ok {
+			v := int(minIn)
+			opts.MinInDegree = &v
+		}
+		if maxIn, ok := args["max_in_degree"].(float64); ok {
+			v := int(maxIn)
+			opts.MaxInDegree = &v
+		}
+		if minOut, ok := args["min_out_degree"].(float64); ok {
+			v := int(minOut)
+			opts.MinOutDegree = &v
+		}
+		if maxOut, ok := args["max_out_degree"].(float64); ok {
+			v := int(maxOut)
+			opts.MaxOutDegree = &v
+		}
+		if ip, ok := args["is_public"].(bool); ok {
+			opts.IsPublic = &ip
+		}
+		if sb, ok := args["sort_by"].(string); ok {
+			opts.SortBy = sb
+		}
+		if lim, ok := args["limit"].(float64); ok {
+			opts.Limit = int(lim)
+		}
+		res := s.queryEng.QueryGraph(opts)
+		data, err := json.MarshalIndent(res, "", "  ")
+		return string(data), err
+
+	case "manage_adr":
+		action, _ := args["action"].(string)
+		switch strings.ToLower(action) {
+		case "list":
+			statusFilter, _ := args["status"].(string)
+			tagFilter, _ := args["tag"].(string)
+			res := s.adrMgr.List(statusFilter, tagFilter)
+			data, err := json.MarshalIndent(res, "", "  ")
+			return string(data), err
+
+		case "get":
+			id, _ := args["id"].(string)
+			res, err := s.adrMgr.Get(id)
+			if err != nil {
+				return "", err
+			}
+			data, err := json.MarshalIndent(res, "", "  ")
+			return string(data), err
+
+		case "create":
+			title, _ := args["title"].(string)
+			status, _ := args["status"].(string)
+			ctx, _ := args["context"].(string)
+			dec, _ := args["decision"].(string)
+			conseq, _ := args["consequences"].(string)
+			var tags []string
+			if rawTags, ok := args["tags"].([]any); ok {
+				for _, t := range rawTags {
+					if str, ok := t.(string); ok {
+						tags = append(tags, str)
+					}
+				}
+			}
+			res, err := s.adrMgr.Create(adr.CreateADROptions{
+				Title:        title,
+				Status:       status,
+				Context:      ctx,
+				Decision:     dec,
+				Consequences: conseq,
+				Tags:         tags,
+			})
+			if err != nil {
+				return "", err
+			}
+			data, err := json.MarshalIndent(res, "", "  ")
+			return string(data), err
+
+		case "update":
+			id, _ := args["id"].(string)
+			upOpts := adr.UpdateADROptions{ID: id}
+			if t, ok := args["title"].(string); ok && t != "" {
+				upOpts.Title = &t
+			}
+			if s, ok := args["status"].(string); ok && s != "" {
+				upOpts.Status = &s
+			}
+			if c, ok := args["context"].(string); ok {
+				upOpts.Context = &c
+			}
+			if d, ok := args["decision"].(string); ok {
+				upOpts.Decision = &d
+			}
+			if cq, ok := args["consequences"].(string); ok {
+				upOpts.Consequences = &cq
+			}
+			if sup, ok := args["superseded_by"].(string); ok {
+				upOpts.SupersededBy = &sup
+			}
+			if rawTags, ok := args["tags"].([]any); ok {
+				var tags []string
+				for _, itm := range rawTags {
+					if str, ok := itm.(string); ok {
+						tags = append(tags, str)
+					}
+				}
+				upOpts.Tags = &tags
+			}
+			res, err := s.adrMgr.Update(upOpts)
+			if err != nil {
+				return "", err
+			}
+			data, err := json.MarshalIndent(res, "", "  ")
+			return string(data), err
+
+		case "delete":
+			id, _ := args["id"].(string)
+			if err := s.adrMgr.Delete(id); err != nil {
+				return "", err
+			}
+			return `{"deleted": true, "id": "` + id + `"}`, nil
+
+		default:
+			return "", fmt.Errorf("unknown manage_adr action: %s", action)
+		}
+
+	case "list_routes":
+		pathPattern, _ := args["path_pattern"].(string)
+		method, _ := args["method"].(string)
+		res := s.routesMgr.FindRoutes(pathPattern, method)
+		data, err := json.MarshalIndent(res, "", "  ")
+		return string(data), err
+
+	case "detect_communities":
+		minSize := 2
+		if ms, ok := args["min_size"].(float64); ok {
+			minSize = int(ms)
+		}
+		res := s.commDetector.DetectCommunities(minSize)
 		data, err := json.MarshalIndent(res, "", "  ")
 		return string(data), err
 

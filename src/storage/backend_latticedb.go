@@ -36,14 +36,14 @@ const (
 // FindNodesByLabelProperty only answers for an explicitly indexed
 // (label, property) pair, so every one of them needs an "id" index before the
 // journal can be replayed.
-var identityIndexLabels = []string{"L0Domain", "L1Module", "L2Class", "L3Symbol"}
+var identityIndexLabels = []string{"L0Domain", "L1Module", "L2Class", "L3Symbol", "Route"}
 
 const (
 	latticeOpenRetries = 10
 	latticeOpenBackoff = 20 * time.Millisecond
 )
 
-// identityLabel picks the level label (L0Domain..L3Symbol) of a node. Labels
+// identityLabel picks the level label (L0Domain..L3Symbol, Route) of a node. Labels
 // such as "File" or "Function" are decorative and are preserved inside "_p".
 func identityLabel(labels []string) string {
 	for _, label := range labels {
@@ -66,6 +66,8 @@ func labelFromID(id string) string {
 		return "L2Class"
 	case strings.HasPrefix(id, "symbol:"):
 		return "L3Symbol"
+	case strings.HasPrefix(id, "route:"):
+		return "Route"
 	default:
 		return ""
 	}
@@ -88,6 +90,8 @@ func labelForLevel(level string) string {
 		return "L2Class"
 	case string(models.LevelL3), "L3Symbol":
 		return "L3Symbol"
+	case "Route":
+		return "Route"
 	default:
 		return ""
 	}
@@ -1598,13 +1602,14 @@ func countNodesAndEdgesInLatticeDB(latticePath string) (map[string]int, bool) {
 		n1, err1 := db.GetNodesByLabel("L1Module")
 		n2, err2 := db.GetNodesByLabel("L2Class")
 		n3, err3 := db.GetNodesByLabel("L3Symbol")
+		nR, _ := db.GetNodesByLabel("Route")
 		if err0 != nil || err1 != nil || err2 != nil || err3 != nil {
 			return nil
 		}
 
-		l0, l1, l2, l3 := len(n0), len(n1), len(n2), len(n3)
+		l0, l1, l2, l3, lR := len(n0), len(n1), len(n2), len(n3), len(nR)
 		counts = map[string]int{
-			"total_nodes": l0 + l1 + l2 + l3,
+			"total_nodes": l0 + l1 + l2 + l3 + lR,
 			"total_edges": int(totalEdges),
 			"l0_domains":  l0,
 			"l1_modules":  l1,

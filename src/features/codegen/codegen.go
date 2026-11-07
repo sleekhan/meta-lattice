@@ -36,7 +36,7 @@ func (c *Codegen) resolvePath(relPath string) (string, string, error) {
 	}
 	// Reject ".." segments explicitly instead of silently neutralizing them,
 	// so traversal attempts are visible to the caller rather than rewritten.
-	if filepath.IsAbs(raw) {
+	if strings.HasPrefix(raw, "/") || strings.HasPrefix(raw, "\\") || filepath.IsAbs(raw) {
 		return "", "", fmt.Errorf("path %q escapes workspace", relPath)
 	}
 	for _, seg := range strings.Split(filepath.ToSlash(raw), "/") {

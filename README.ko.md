@@ -399,6 +399,15 @@ Google Antigravity(IDE 및 CLI) 환경에서는 MCP 서버 연동과 더불어 *
 ./meta-lattice apply-plan --file plan.json            # dry-run 검증 (쓰기 없음)
 ./meta-lattice apply-plan --file plan.json --execute  # 실제 적용 (실패 시 롤백)
 
+# 5c. 다중 홉 호출 경로 추적 및 Git Diff 변경 영향도 분석 (신규)
+./meta-lattice trace NewMCPServer --depth 3           # 심볼 간 다중 홉 호출 체인 트리 탐색
+./meta-lattice trace NewMCPServer --target GetConfig  # 시작점과 끝점 간 최단 호출 경로 탐색
+./meta-lattice detect-changes --scope tests           # Git diff 기반 변경 심볼 및 영향받는 테스트 목록 추출
+./meta-lattice query --dead-code                      # 구조적 코드 그래프 질의 (미사용 데드코드/핫스팟 필터)
+./meta-lattice routes --path /api/v1/users            # API 엔드포인트 탐색 (Gin, Express, FastAPI, Spring, Next.js)
+./meta-lattice communities                            # Louvain 커뮤니티 탐지 (토폴로지 클러스터 및 경계 드리프트)
+./meta-lattice adr list                               # 아키텍처 결정 기록(ADR) 관리
+
 # 6. MCP 서버 구동 (stdio)
 ./meta-lattice mcp
 
@@ -431,6 +440,12 @@ Google Antigravity(IDE 및 CLI) 환경에서는 MCP 서버 연동과 더불어 *
 | `get_index_status` | 없음 | 노드/엣지 현황 및 캐시 통계 확인 |
 | `scaffold_module` | `file_path: string, kind?: string, name?: string, namespace?: string, imports?: string[], overwrite?: bool` | 코드 생성: 언어별 템플릿으로 신규 소스 파일 생성 (워크스페이스 한정, 기본 덮어쓰기 거부) |
 | `apply_plan` | `operations: array, dry_run?: bool` | 코드 생성: 파일 편집 배치 적용 (`create_file`, `replace_text`, `insert_after`, `delete_file`), dry-run 검증 및 실패 시 자동 롤백 |
+| `trace_call_path` | `source: string, target?: string, direction?: string, max_depth?: int` | 심볼 간 다중 홉 호출 실행 경로 추적 또는 호출자/피호출자 트리 탐색 |
+| `detect_changes` | `base_ref?: string, scope?: string, max_hops?: int` | Git diff 기반 변경 심볼 및 영향도(Blast Score), 실행 대상 테스트 목록 스코핑 |
+| `query_graph` | `level?: string, kind?: string, min_complexity?: int, min_in_degree?: int, max_in_degree?: int, ...` | 복합 조건 기반 구조적 코드 그래프 질의 (데드코드, 핫스팟, 복잡도, 접근 제어 등) |
+| `manage_adr` | `action: string, id?: string, title?: string, status?: string, ...` | 아키텍처 결정 기록(ADR) 관리: 생성, 조회, 목록, 갱신, 삭제 |
+| `list_routes` | `path_pattern?: string, method?: string` | API 엔드포인트 탐색: HTTP 라우트, 메서드, 프레임워크, 핸들러 심볼 역추적 |
+| `detect_communities` | `min_size?: int` | Louvain 커뮤니티 탐지: 결합도 기반 기능 클러스터, 모듈화 Q 지수, 아키텍처 경계 드리프트 진단 |
 
 ---
 

@@ -11,9 +11,15 @@ import (
 	"time"
 
 	"meta-lattice/src/config"
+	"meta-lattice/src/features/adr"
 	"meta-lattice/src/features/auditor"
 	"meta-lattice/src/features/blast"
 	"meta-lattice/src/features/codegen"
+	"meta-lattice/src/features/community"
+	"meta-lattice/src/features/diff"
+	"meta-lattice/src/features/query"
+	"meta-lattice/src/features/routes"
+	"meta-lattice/src/features/tracer"
 	"meta-lattice/src/features/zoomer"
 	"meta-lattice/src/indexer"
 	"meta-lattice/src/installer"
@@ -45,6 +51,18 @@ func main() {
 		runStatus(os.Args[2:])
 	case "zoom":
 		runZoom(os.Args[2:])
+	case "trace":
+		runTrace(os.Args[2:])
+	case "detect-changes":
+		runDetectChanges(os.Args[2:])
+	case "query":
+		runQuery(os.Args[2:])
+	case "adr":
+		runADR(os.Args[2:])
+	case "routes":
+		runRoutes(os.Args[2:])
+	case "communities", "clusters":
+		runCommunities(os.Args[2:])
 	case "audit":
 		runAudit(os.Args[2:])
 	case "blast":
@@ -83,6 +101,18 @@ Commands:
                            Options: --json
   zoom <action> [target]   Hierarchical Context Zoom (actions: overview, module, symbol, search)
                            Options: --no-sync, --json
+  trace <symbol>           Call Chain Tracer: Multi-hop call path tracking
+                           Options: --target <sym>, --direction <outbound|inbound|both>, --depth <n>, --no-sync, --json
+  detect-changes           Change Impact Scoper: Map git diff to affected symbols and tests
+                           Options: --base <ref>, --scope <all|tests>, --hops <n>, --no-sync, --json
+  query                    Structural Code Graph Query: Filter by complexity, degree, kind, etc.
+                           Options: --level <L0..L3>, --kind <k>, --min-complexity <n>, --dead-code, --hotspots, --json
+  routes                   API Route Discovery: Inspect and search indexed HTTP/API endpoints
+                           Options: --path <pattern>, --method <GET|POST...>, --no-sync, --json
+  communities              Louvain Community Detection: Find topological clusters & boundary drift
+                           Options: --min-size <n>, --no-sync, --json
+  adr <action>             Architecture Decision Records: Manage ADRs across agent sessions
+                           Actions: list, get <id>, create --title "..." --decision "...", delete <id>
   audit                    Architecture Boundary Auditor: Check circular dependencies & layer violations
                            Options: --file <path>, --no-sync, --json
   blast <target>           Blast Radius Estimator: Simulate ripple effects and breaking changes
@@ -430,6 +460,386 @@ func runBlast(args []string) {
 
 	fmt.Println("\nImpact Cascade Tree:")
 	fmt.Println(res["blast_tree"])
+}
+
+func runTrace(args []string) {
+	args, asJSON := popBoolFlag(args, "json")
+	args, noSync := popBoolFlag(args, "no-sync")
+	if len(args) == 0 {
+		fmt.Println("Error: Target symbol or file is required for 'trace'.")
+		return
+	}
+	source := args[0]
+	target := ""
+	direction := "outbound"
+	depth := 3
+
+	for i := 1; i < len(args); i++ {
+		if args[i] == "--target" && i+1 < len(args) {
+			target = args[i+1]
+			i++
+		} else if args[i] == "--direction" && i+1 < len(args) {
+			direction = args[i+1]
+			i++
+		} else if (args[i] == "--depth" || args[i] == "--hops") && i+1 < len(args) {
+			if d, err := strconv.Atoi(args[i+1]); err == nil {
+				depth = d
+			}
+			i++
+		}
+	}
+
+	_, db, _ := openWorkspace(!noSync)
+	tc := tracer.NewCallTracer(db)
+	res := tc.TraceCallPath(source, target, direction, depth)
+
+	if asJSON {
+		printJSON(res)
+		return
+	}
+
+	if res.Error != "" {
+		fmt.Printf("Error: %s\n", res.Error)
+		return
+	}
+
+	fmt.Printf("\n=== Call Chain Trace: %s (Direction: %s, Max Depth: %d) ===\n", source, direction, depth)
+	if target != "" {
+		fmt.Printf("Target: %s | Paths Found: %d\n\n", target, res.PathsFound)
+		for idx, p := range res.Paths {
+			fmt.Printf("[Path #%d] (Length: %d hops)\n", idx+1, len(p))
+			for _, hop := range p {
+				fmt.Printf("  Step %d: %s (%s:%s) --[%s]--> %s (%s:%s)\n",
+					hop.HopDepth, hop.FromName, hop.FromFile, hop.FromLines, hop.EdgeType, hop.ToName, hop.ToFile, hop.ToLines)
+			}
+		}
+	} else {
+		fmt.Printf("Total Traversal Hops: %d | Unique Symbols Reached: %d\n\n", res.TotalHops, res.UniqueSymbols)
+		for _, step := range res.CallTree {
+			depth := step["depth"].(int)
+			indent := strings.Repeat("  ", depth)
+			fmt.Printf("%s└─ [Hop %d] %s (%s:%s) -> %s\n",
+				indent, depth, step["to_name"], step["to_file"], step["to_lines"], step["to_signature"])
+		}
+	}
+}
+
+func runDetectChanges(args []string) {
+	args, asJSON := popBoolFlag(args, "json")
+	args, noSync := popBoolFlag(args, "no-sync")
+	baseRef := ""
+	scope := "all"
+	hops := 3
+
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--base" && i+1 < len(args) {
+			baseRef = args[i+1]
+			i++
+		} else if args[i] == "--scope" && i+1 < len(args) {
+			scope = args[i+1]
+			i++
+		} else if args[i] == "--hops" && i+1 < len(args) {
+			if h, err := strconv.Atoi(args[i+1]); err == nil {
+				hops = h
+			}
+			i++
+		}
+	}
+
+	cfg, db, _ := openWorkspace(!noSync)
+	cd := diff.NewChangeDetector(cfg, db)
+	res := cd.DetectChanges(baseRef, scope, hops, "")
+
+	if asJSON {
+		printJSON(res)
+		return
+	}
+
+	if res.Error != "" {
+		fmt.Printf("Error: %s\n", res.Error)
+		return
+	}
+
+	fmt.Printf("\n=== Git Change Impact Analysis ===\n")
+	fmt.Printf("Base Ref:   %s\n", func() string {
+		if res.BaseRef != "" {
+			return res.BaseRef
+		}
+		return "(uncommitted/HEAD)"
+	}())
+	fmt.Printf("Risk Level: %s (Blast Score: %d/100)\n", res.RiskTier, res.BlastScore)
+	fmt.Printf("Summary:    %s\n", res.Summary)
+
+	if len(res.ChangedSymbols) > 0 {
+		fmt.Printf("\n[Directly Touched Symbols: %d]\n", len(res.ChangedSymbols))
+		for _, s := range res.ChangedSymbols {
+			fmt.Printf("  • %-30s (%s:%s) - %s\n", s.Name, s.FilePath, s.Lines, s.Signature)
+		}
+	}
+
+	if len(res.AffectedTests) > 0 {
+		fmt.Printf("\n[Affected Test Targets to Run: %d]\n", len(res.AffectedTests))
+		for _, t := range res.AffectedTests {
+			fmt.Printf("  • [Hop %d] %s (in %s) [triggered by %s]\n", t.Distance, t.TestSymbol, t.TestFile, t.TargetSymbol)
+		}
+	}
+
+	if len(res.AffectedSymbols) > 0 && scope != "tests" {
+		fmt.Printf("\n[Top Downstream Impacted Symbols: %d]\n", len(res.AffectedSymbols))
+		limit := 10
+		if len(res.AffectedSymbols) < limit {
+			limit = len(res.AffectedSymbols)
+		}
+		for _, a := range res.AffectedSymbols[:limit] {
+			fmt.Printf("  • [Hop %d] %-30s (%s)\n", a.Distance, a.Name, a.FilePath)
+		}
+	}
+}
+
+func runQuery(args []string) {
+	args, asJSON := popBoolFlag(args, "json")
+	args, noSync := popBoolFlag(args, "no-sync")
+	args, deadCode := popBoolFlag(args, "dead-code")
+	args, hotspots := popBoolFlag(args, "hotspots")
+
+	opts := query.GraphQueryOptions{Limit: 25}
+	if deadCode {
+		zero := 0
+		opts.MaxInDegree = &zero
+		opts.MaxOutDegree = &zero
+	}
+	if hotspots {
+		minIn := 5
+		opts.MinInDegree = &minIn
+		opts.SortBy = "hotspot"
+	}
+
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--level" && i+1 < len(args) {
+			opts.Level = args[i+1]
+			i++
+		} else if args[i] == "--kind" && i+1 < len(args) {
+			opts.Kind = args[i+1]
+			i++
+		} else if args[i] == "--name" && i+1 < len(args) {
+			opts.NamePattern = args[i+1]
+			i++
+		} else if args[i] == "--file" && i+1 < len(args) {
+			opts.FilePattern = args[i+1]
+			i++
+		} else if args[i] == "--min-complexity" && i+1 < len(args) {
+			if c, err := strconv.Atoi(args[i+1]); err == nil {
+				opts.MinComplexity = c
+			}
+			i++
+		} else if args[i] == "--min-in-degree" && i+1 < len(args) {
+			if d, err := strconv.Atoi(args[i+1]); err == nil {
+				opts.MinInDegree = &d
+			}
+			i++
+		} else if args[i] == "--sort" && i+1 < len(args) {
+			opts.SortBy = args[i+1]
+			i++
+		} else if args[i] == "--limit" && i+1 < len(args) {
+			if l, err := strconv.Atoi(args[i+1]); err == nil {
+				opts.Limit = l
+			}
+			i++
+		}
+	}
+
+	_, db, _ := openWorkspace(!noSync)
+	qe := query.NewGraphQueryEngine(db)
+	res := qe.QueryGraph(opts)
+
+	if asJSON {
+		printJSON(res)
+		return
+	}
+
+	fmt.Printf("\n=== Graph Query Results: %d matched (scanned: %d) ===\n", res.TotalMatched, res.TotalScanned)
+	for _, n := range res.Nodes {
+		fmt.Printf("  • [%s] %-30s (%s:%s)\n", n.Level, n.Name, n.FilePath, n.Lines)
+		fmt.Printf("    In-degree: %d | Out-degree: %d | Complexity: %d | Signature: %s\n",
+			n.InDegree, n.OutDegree, n.CyclomaticComplexity, n.Signature)
+	}
+}
+
+func runADR(args []string) {
+	args, asJSON := popBoolFlag(args, "json")
+	if len(args) == 0 {
+		fmt.Println("Usage: meta-lattice adr <list|get|create|update|delete> [arguments]")
+		return
+	}
+	action := args[0]
+	cfg := config.GetConfig()
+	am := adr.NewADRManager(cfg)
+
+	switch strings.ToLower(action) {
+	case "list":
+		all := am.List("", "")
+		if asJSON {
+			printJSON(all)
+			return
+		}
+		fmt.Printf("\n=== Architecture Decision Records (%d total) ===\n", len(all))
+		for _, r := range all {
+			fmt.Printf("  • %-10s [%s] %s (%s)\n", r.ID, strings.ToUpper(string(r.Status)), r.Title, r.Date)
+		}
+
+	case "get":
+		if len(args) < 2 {
+			fmt.Println("Error: ADR ID or number is required.")
+			return
+		}
+		rec, err := am.Get(args[1])
+		if err != nil {
+			fmt.Printf("Error: %s\n", err)
+			return
+		}
+		if asJSON {
+			printJSON(rec)
+			return
+		}
+		fmt.Printf("\n=== %s: %s ===\n", rec.ID, rec.Title)
+		fmt.Printf("Status:       %s\n", rec.Status)
+		fmt.Printf("Date:         %s\n", rec.Date)
+		fmt.Printf("Tags:         %s\n", strings.Join(rec.Tags, ", "))
+		if rec.SupersededBy != "" {
+			fmt.Printf("Superseded By:%s\n", rec.SupersededBy)
+		}
+		fmt.Printf("\n[Context]\n%s\n", rec.Context)
+		fmt.Printf("\n[Decision]\n%s\n", rec.Decision)
+		fmt.Printf("\n[Consequences]\n%s\n", rec.Consequences)
+
+	case "create":
+		fs := flag.NewFlagSet("adr-create", flag.ExitOnError)
+		title := fs.String("title", "", "ADR title")
+		status := fs.String("status", "accepted", "ADR status")
+		context := fs.String("context", "", "ADR context")
+		decision := fs.String("decision", "", "ADR decision")
+		consequences := fs.String("consequences", "", "ADR consequences")
+		tagsCSV := fs.String("tags", "", "Comma-separated tags")
+		_ = fs.Parse(args[1:])
+
+		var tags []string
+		for _, t := range strings.Split(*tagsCSV, ",") {
+			if t = strings.TrimSpace(t); t != "" {
+				tags = append(tags, t)
+			}
+		}
+		rec, err := am.Create(adr.CreateADROptions{
+			Title:        *title,
+			Status:       *status,
+			Context:      *context,
+			Decision:     *decision,
+			Consequences: *consequences,
+			Tags:         tags,
+		})
+		if err != nil {
+			fmt.Printf("Error: %s\n", err)
+			return
+		}
+		if asJSON {
+			printJSON(rec)
+			return
+		}
+		fmt.Printf("\n[✓] Created %s: %s\n", rec.ID, rec.Title)
+
+	case "delete":
+		if len(args) < 2 {
+			fmt.Println("Error: ADR ID is required for delete.")
+			return
+		}
+		if err := am.Delete(args[1]); err != nil {
+			fmt.Printf("Error: %s\n", err)
+			return
+		}
+		fmt.Printf("[✓] Deleted %s\n", args[1])
+
+	default:
+		fmt.Printf("Unknown adr action: %s\n", action)
+	}
+}
+
+func runRoutes(args []string) {
+	args, asJSON := popBoolFlag(args, "json")
+	args, noSync := popBoolFlag(args, "no-sync")
+	pathPattern := ""
+	method := ""
+
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--path" && i+1 < len(args) {
+			pathPattern = args[i+1]
+			i++
+		} else if args[i] == "--method" && i+1 < len(args) {
+			method = args[i+1]
+			i++
+		}
+	}
+
+	_, db, _ := openWorkspace(!noSync)
+	rm := routes.NewRouteManager(db)
+	res := rm.FindRoutes(pathPattern, method)
+
+	if asJSON {
+		printJSON(res)
+		return
+	}
+
+	fmt.Printf("\n=== Discovered HTTP / API Endpoints (%d matched) ===\n", len(res))
+	if len(res) == 0 {
+		fmt.Println("No routes matched. Run `meta-lattice sync` to update the AST index.")
+		return
+	}
+	for _, r := range res {
+		fmt.Printf("  • %-7s %-35s -> %s (%s:%d) [%s]\n",
+			r.Method, r.Path, r.HandlerName, r.FilePath, r.Line, r.Framework)
+	}
+}
+
+func runCommunities(args []string) {
+	args, asJSON := popBoolFlag(args, "json")
+	args, noSync := popBoolFlag(args, "no-sync")
+	minSize := 2
+
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--min-size" && i+1 < len(args) {
+			if s, err := strconv.Atoi(args[i+1]); err == nil {
+				minSize = s
+			}
+			i++
+		}
+	}
+
+	_, db, _ := openWorkspace(!noSync)
+	detector := community.NewCommunityDetector(db)
+	res := detector.DetectCommunities(minSize)
+
+	if asJSON {
+		printJSON(res)
+		return
+	}
+
+	fmt.Printf("\n=== Louvain Topological Community Detection ===\n")
+	fmt.Printf("Modularity Q:        %0.3f [%s]\n", res.ModularityScore, res.ArchitectureHealth)
+	fmt.Printf("Discovered Clusters: %d communities across %d modules\n", res.CommunityCount, res.TotalModules)
+	fmt.Printf("Summary:             %s\n\n", res.Summary)
+
+	for _, c := range res.Communities {
+		fmt.Printf("[Cluster %s: %s] (%d modules, Cohesion: %0.2f)\n", c.ID, strings.ToUpper(c.SuggestedName), c.Size, c.Cohesion)
+		for _, m := range c.Modules {
+			fmt.Printf("  └─ %s\n", m)
+		}
+		fmt.Println()
+	}
+
+	if len(res.DriftAlerts) > 0 {
+		fmt.Printf("[Architecture Boundary Drift Alerts: %d]\n", len(res.DriftAlerts))
+		for _, a := range res.DriftAlerts {
+			fmt.Printf("  ⚠️ %s\n", a.Recommendation)
+		}
+	}
 }
 
 func runScaffold(args []string) {
