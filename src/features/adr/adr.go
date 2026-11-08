@@ -316,4 +316,3 @@ func (m *ADRManager) Delete(idOrNumber string) error {
 	delete(m.records, key)
 	return m.saveLocked()
 }
-

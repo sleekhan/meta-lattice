@@ -65,4 +65,3 @@ func TestADRManagerCRUD(t *testing.T) {
 		t.Fatalf("expected 0 ADRs after delete")
 	}
 }
-

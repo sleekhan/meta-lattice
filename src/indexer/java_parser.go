@@ -10,8 +10,8 @@ import (
 )
 
 var (
-	javaPackageRegex = regexp.MustCompile(`(?m)^\s*package\s+([a-zA-Z0-9_.]+)\s*;`)
-	javaImportRegex  = regexp.MustCompile(`(?m)^\s*import\s+(?:static\s+)?([a-zA-Z0-9_.*]+)\s*;`)
+	javaPackageRegex  = regexp.MustCompile(`(?m)^\s*package\s+([a-zA-Z0-9_.]+)\s*;`)
+	javaImportRegex   = regexp.MustCompile(`(?m)^\s*import\s+(?:static\s+)?([a-zA-Z0-9_.*]+)\s*;`)
 	javaTypeDeclRegex = regexp.MustCompile(`(?m)(?:public|protected|private|abstract|final|static|\s)*\b(class|interface|enum|record)\s+([a-zA-Z0-9_]+)(?:<[^>]+>)?(?:\s+extends\s+[a-zA-Z0-9_<>.,\s]+)?(?:\s+implements\s+[a-zA-Z0-9_<>.,\s]+)?`)
 	javaMethodRegex   = regexp.MustCompile(`(?m)(?:(?:public|protected|private|static|final|abstract|synchronized|native|default)\s+)+([a-zA-Z0-9_<>[\].,\s]+)\s+([a-zA-Z0-9_]+)\s*\(([^)]*)\)\s*(?:throws\s+[a-zA-Z0-9_,\s]+)?\s*\{?`)
 	javaCallRegex     = regexp.MustCompile(`\b([a-zA-Z0-9_]+)\s*\(`)

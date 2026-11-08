@@ -13,15 +13,15 @@ import (
 )
 
 type Community struct {
-	ID                 string         `json:"id"`
-	SuggestedName      string         `json:"suggested_name"`
-	Modules            []string       `json:"modules"`
-	Size               int            `json:"size"`
-	InternalWeight     float64        `json:"internal_weight"`
-	ExternalWeight     float64        `json:"external_weight"`
-	Cohesion           float64        `json:"cohesion"`
-	PhysicalDomains    map[string]int `json:"physical_domains"`
-	SpansMultipleDirs  bool           `json:"spans_multiple_dirs"`
+	ID                string         `json:"id"`
+	SuggestedName     string         `json:"suggested_name"`
+	Modules           []string       `json:"modules"`
+	Size              int            `json:"size"`
+	InternalWeight    float64        `json:"internal_weight"`
+	ExternalWeight    float64        `json:"external_weight"`
+	Cohesion          float64        `json:"cohesion"`
+	PhysicalDomains   map[string]int `json:"physical_domains"`
+	SpansMultipleDirs bool           `json:"spans_multiple_dirs"`
 }
 
 type DriftAlert struct {

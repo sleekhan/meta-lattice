@@ -134,4 +134,3 @@ func TestDetectChangesWithASTAndTests(t *testing.T) {
 		t.Errorf("expected src/service_test.go, got %s", res.AffectedTests[0].TestFile)
 	}
 }
-

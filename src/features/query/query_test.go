@@ -76,4 +76,3 @@ func TestGraphQueryEngine(t *testing.T) {
 		t.Fatalf("expected ComplexFunc in a.go, got %+v", res3)
 	}
 }
-

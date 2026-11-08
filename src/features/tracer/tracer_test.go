@@ -101,4 +101,3 @@ func TestCallTracerTreeAndPath(t *testing.T) {
 		t.Fatalf("expected 2 inbound hops (C<-B, B<-A), got %d", inRes.TotalHops)
 	}
 }
-

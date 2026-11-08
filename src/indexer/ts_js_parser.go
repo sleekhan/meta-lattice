@@ -9,13 +9,13 @@ import (
 )
 
 var (
-	tsImportRegex = regexp.MustCompile(`(?m)^\s*import\s+(?:(?:\*\s+as\s+([a-zA-Z0-9_]+)|{([^}]+)}|([a-zA-Z0-9_]+))\s+from\s+)?['"]([^'"]+)['"]`)
-	tsClassRegex  = regexp.MustCompile(`(?m)^\s*(?:export\s+)?(?:default\s+)?class\s+([a-zA-Z0-9_]+)(?:\s+extends\s+([a-zA-Z0-9_.]+))?(?:\s+implements\s+([^{]+))?\s*\{`)
-	tsIfaceRegex  = regexp.MustCompile(`(?m)^\s*(?:export\s+)?interface\s+([a-zA-Z0-9_]+)(?:\s+extends\s+([^{]+))?\s*\{`)
-	tsFuncRegex   = regexp.MustCompile(`(?m)^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+([a-zA-Z0-9_]+)\s*\(`)
-	tsArrowRegex  = regexp.MustCompile(`(?m)^\s*(?:export\s+)?(?:const|let|var)\s+([a-zA-Z0-9_]+)\s*=\s*(?:async\s+)?\([^)]*\)\s*(?::\s*[^=]+)?=>`)
-	tsCallRegex   = regexp.MustCompile(`([a-zA-Z0-9_]+)\s*\(`)
-	tsIdentRegex  = regexp.MustCompile(`^[A-Za-z_#][A-Za-z0-9_]*$`)
+	tsImportRegex  = regexp.MustCompile(`(?m)^\s*import\s+(?:(?:\*\s+as\s+([a-zA-Z0-9_]+)|{([^}]+)}|([a-zA-Z0-9_]+))\s+from\s+)?['"]([^'"]+)['"]`)
+	tsClassRegex   = regexp.MustCompile(`(?m)^\s*(?:export\s+)?(?:default\s+)?class\s+([a-zA-Z0-9_]+)(?:\s+extends\s+([a-zA-Z0-9_.]+))?(?:\s+implements\s+([^{]+))?\s*\{`)
+	tsIfaceRegex   = regexp.MustCompile(`(?m)^\s*(?:export\s+)?interface\s+([a-zA-Z0-9_]+)(?:\s+extends\s+([^{]+))?\s*\{`)
+	tsFuncRegex    = regexp.MustCompile(`(?m)^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+([a-zA-Z0-9_]+)\s*\(`)
+	tsArrowRegex   = regexp.MustCompile(`(?m)^\s*(?:export\s+)?(?:const|let|var)\s+([a-zA-Z0-9_]+)\s*=\s*(?:async\s+)?\([^)]*\)\s*(?::\s*[^=]+)?=>`)
+	tsCallRegex    = regexp.MustCompile(`([a-zA-Z0-9_]+)\s*\(`)
+	tsIdentRegex   = regexp.MustCompile(`^[A-Za-z_#][A-Za-z0-9_]*$`)
 	tsKeywordCalls = map[string]bool{
 		"if": true, "for": true, "while": true, "switch": true, "catch": true,
 		"return": true, "new": true, "typeof": true, "React": true,
@@ -274,7 +274,7 @@ func ParseTSJSFile(filePath string, sourceCode string, sha string, domain string
 										Calls:                uniqueStrings(calls),
 										Level:                string(models.LevelL3),
 										Labels:               []string{"L3Symbol", "Symbol", "Function"},
-								})
+									})
 								}
 							}
 						}

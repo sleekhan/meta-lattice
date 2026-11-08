@@ -10,30 +10,30 @@ import (
 )
 
 type CallHop struct {
-	FromID       string `json:"from_id"`
-	FromName     string `json:"from_name"`
-	FromFile     string `json:"from_file"`
-	FromLines    string `json:"from_lines,omitempty"`
-	ToID         string `json:"to_id"`
-	ToName       string `json:"to_name"`
-	ToFile       string `json:"to_file"`
-	ToLines      string `json:"to_lines,omitempty"`
-	EdgeType     string `json:"edge_type"`
-	HopDepth     int    `json:"hop_depth"`
+	FromID    string `json:"from_id"`
+	FromName  string `json:"from_name"`
+	FromFile  string `json:"from_file"`
+	FromLines string `json:"from_lines,omitempty"`
+	ToID      string `json:"to_id"`
+	ToName    string `json:"to_name"`
+	ToFile    string `json:"to_file"`
+	ToLines   string `json:"to_lines,omitempty"`
+	EdgeType  string `json:"edge_type"`
+	HopDepth  int    `json:"hop_depth"`
 }
 
 type CallPathResult struct {
-	Source         string         `json:"source"`
-	Target         string         `json:"target,omitempty"`
-	Direction      string         `json:"direction"`
-	MaxDepth       int            `json:"max_depth"`
-	TotalHops      int            `json:"total_hops"`
-	PathsFound     int            `json:"paths_found"`
-	Paths          [][]CallHop    `json:"paths,omitempty"`
-	CallTree       []map[string]any `json:"call_tree,omitempty"`
-	UniqueSymbols  int            `json:"unique_symbols"`
-	Truncated      bool           `json:"truncated,omitempty"`
-	Error          string         `json:"error,omitempty"`
+	Source        string           `json:"source"`
+	Target        string           `json:"target,omitempty"`
+	Direction     string           `json:"direction"`
+	MaxDepth      int              `json:"max_depth"`
+	TotalHops     int              `json:"total_hops"`
+	PathsFound    int              `json:"paths_found"`
+	Paths         [][]CallHop      `json:"paths,omitempty"`
+	CallTree      []map[string]any `json:"call_tree,omitempty"`
+	UniqueSymbols int              `json:"unique_symbols"`
+	Truncated     bool             `json:"truncated,omitempty"`
+	Error         string           `json:"error,omitempty"`
 }
 
 type CallTracer struct {

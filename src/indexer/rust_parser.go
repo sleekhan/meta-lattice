@@ -11,11 +11,11 @@ import (
 )
 
 var (
-	rustUseRegex    = regexp.MustCompile(`(?m)^\s*pub(?:\([^)]+\))?\s+use\s+([^;]+);|^\s*use\s+([^;]+);`)
-	rustTypeRegex   = regexp.MustCompile(`(?m)^\s*(?:pub(?:\([^)]+\))?\s+)?(struct|enum|trait|union)\s+([a-zA-Z0-9_]+)`)
-	rustImplRegex   = regexp.MustCompile(`(?m)^\s*impl(?:<[^>]+>)?\s+(?:([a-zA-Z0-9_:]+)\s+for\s+)?([a-zA-Z0-9_]+)`)
-	rustFnRegex     = regexp.MustCompile(`(?m)^\s*(pub(?:\([^)]+\))?\s+)?(?:async\s+)?(?:const\s+)?(?:unsafe\s+)?fn\s+([a-zA-Z0-9_]+)(?:<[^>]+>)?\s*\(([^)]*)\)(?:\s*->\s*([^{;]+))?`)
-	rustCallRegex   = regexp.MustCompile(`\b([a-zA-Z0-9_]+)\s*\(`)
+	rustUseRegex     = regexp.MustCompile(`(?m)^\s*pub(?:\([^)]+\))?\s+use\s+([^;]+);|^\s*use\s+([^;]+);`)
+	rustTypeRegex    = regexp.MustCompile(`(?m)^\s*(?:pub(?:\([^)]+\))?\s+)?(struct|enum|trait|union)\s+([a-zA-Z0-9_]+)`)
+	rustImplRegex    = regexp.MustCompile(`(?m)^\s*impl(?:<[^>]+>)?\s+(?:([a-zA-Z0-9_:]+)\s+for\s+)?([a-zA-Z0-9_]+)`)
+	rustFnRegex      = regexp.MustCompile(`(?m)^\s*(pub(?:\([^)]+\))?\s+)?(?:async\s+)?(?:const\s+)?(?:unsafe\s+)?fn\s+([a-zA-Z0-9_]+)(?:<[^>]+>)?\s*\(([^)]*)\)(?:\s*->\s*([^{;]+))?`)
+	rustCallRegex    = regexp.MustCompile(`\b([a-zA-Z0-9_]+)\s*\(`)
 	rustKeywordCalls = map[string]bool{
 		"if": true, "match": true, "for": true, "while": true,
 		"return": true, "let": true, "use": true,

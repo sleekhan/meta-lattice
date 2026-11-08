@@ -152,4 +152,3 @@ func TestRouteManagerIndexAndFind(t *testing.T) {
 		t.Errorf("expected EXPOSES_ROUTE edge, got %+v", edges)
 	}
 }
-

@@ -53,4 +53,3 @@ func TestLouvainCommunityDetection(t *testing.T) {
 		}
 	}
 }
-
