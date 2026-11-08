@@ -274,8 +274,22 @@ func runZoom(args []string) {
 		fmt.Printf("\n=== L0/L1 Architectural Overview (%d domains) ===\n", len(domains))
 		for _, d := range domains {
 			modules, _ := d["modules"].([]map[string]any)
+			// Overviews above the token-guard threshold only carry a sample of
+			// modules, so fall back to those when the full list is absent.
+			sampled := false
+			if len(modules) == 0 {
+				if sample, ok := d["sample_modules"].([]map[string]any); ok && len(sample) > 0 {
+					modules = sample
+					sampled = true
+				}
+			}
+			total, _ := d["total_modules"].(int)
 			fmt.Printf("\n[Domain: %s] (%v modules)\n", d["name"], d["total_modules"])
 			for _, m := range modules {
+				if sampled {
+					fmt.Printf("  - %s (%v LOC)\n", m["path"], m["loc"])
+					continue
+				}
 				var exportsStr string
 				if ex, ok := m["exports"].([]string); ok {
 					exportsStr = strings.Join(ex, ", ")
@@ -284,6 +298,12 @@ func runZoom(args []string) {
 					exportsStr = "none"
 				}
 				fmt.Printf("  - %s (%v LOC) - exports: %s\n", m["path"], m["loc"], exportsStr)
+			}
+			if sampled && len(modules) < total {
+				fmt.Printf("  ... showing %d of %v modules (name a domain for the full list)\n", len(modules), total)
+			}
+			if len(modules) == 0 {
+				fmt.Println("  (no modules)")
 			}
 		}
 
