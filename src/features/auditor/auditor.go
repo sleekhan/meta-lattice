@@ -35,45 +35,73 @@ type moduleGraph struct {
 	inEdges  map[string][]moduleEdge
 }
 
-func (a *ArchitectureBoundaryAuditor) getModuleGraph() *moduleGraph {
+func (a *ArchitectureBoundaryAuditor) getModuleGraph(targetPath string) *moduleGraph {
 	mg := &moduleGraph{
 		nodes:    make(map[string]map[string]any),
 		outEdges: make(map[string][]moduleEdge),
 		inEdges:  make(map[string][]moduleEdge),
 	}
 
+	// A whole-repository audit needs every module node (for layer rules and
+	// coupling metrics). A scoped audit only needs the target module and the
+	// modules it imports, so hydrating all L1 nodes would be wasted work: it
+	// costs ~56ms per 3,000 modules on the post-edit hook path.
 	byID := make(map[string]map[string]any)
-	for _, n := range a.db.QueryNodes(string(models.LevelL1), "", 0) {
-		id, _ := n["id"].(string)
-		filePath, _ := n["path"].(string)
-		if filePath == "" {
-			filePath = strings.TrimPrefix(id, "file:")
+	if targetPath == "" {
+		for _, n := range a.db.QueryNodes(string(models.LevelL1), "", 0) {
+			id, _ := n["id"].(string)
+			filePath, _ := n["path"].(string)
+			if filePath == "" {
+				filePath = strings.TrimPrefix(id, "file:")
+			}
+			mg.nodes[filePath] = n
+			if id != "" {
+				byID[id] = n
+			}
 		}
-		mg.nodes[filePath] = n
-		if id != "" {
-			byID[id] = n
+	} else if len(a.db.GetOutgoingEdges("file:"+targetPath, string(models.EdgeImports))) == 0 &&
+		len(a.db.GetIncomingEdges("file:"+targetPath, string(models.EdgeImports))) == 0 {
+		// No import edge in either direction: the file cannot break a layer
+		// boundary or close a cycle, so the global edge scan is unnecessary.
+		// Keep the target in the node map so its coupling metrics stay 0/0
+		// instead of disappearing from the report.
+		a.hydrateModuleNode(mg, targetPath)
+		return mg
+	}
+
+	// resolveModulePath maps an import endpoint to its workspace-relative path.
+	// Scoped audits derive it from the stable "file:" node ID instead of
+	// loading every module node; whole-repository audits keep resolving real
+	// nodes so that dangling edges stay excluded.
+	resolveModulePath := func(id string) (string, bool) {
+		if node, ok := byID[id]; ok {
+			path, _ := node["path"].(string)
+			if path == "" {
+				path = strings.TrimPrefix(id, "file:")
+			}
+			return path, true
 		}
+		if targetPath != "" {
+			if path, ok := fileNodePath(id); ok {
+				return path, true
+			}
+			return "", false
+		}
+		node, ok := a.db.GetNode(id)
+		if !ok {
+			return "", false
+		}
+		path, _ := node["path"].(string)
+		if path == "" {
+			path = strings.TrimPrefix(id, "file:")
+		}
+		return path, true
 	}
 
 	for _, e := range a.db.GetEdgesByType(string(models.EdgeImports)) {
-		srcNode, okSrc := byID[e.SourceID]
-		if !okSrc {
-			srcNode, okSrc = a.db.GetNode(e.SourceID)
-		}
-		tgtNode, okTgt := byID[e.TargetID]
-		if !okTgt {
-			tgtNode, okTgt = a.db.GetNode(e.TargetID)
-		}
+		srcPath, okSrc := resolveModulePath(e.SourceID)
+		tgtPath, okTgt := resolveModulePath(e.TargetID)
 		if okSrc && okTgt {
-			srcPath, _ := srcNode["path"].(string)
-			if srcPath == "" {
-				srcPath = strings.TrimPrefix(e.SourceID, "file:")
-			}
-			tgtPath, _ := tgtNode["path"].(string)
-			if tgtPath == "" {
-				tgtPath = strings.TrimPrefix(e.TargetID, "file:")
-			}
-
 			var impNames []string
 			if raw, ok := e.Properties["imported_names"].([]string); ok {
 				impNames = raw
@@ -95,7 +123,38 @@ func (a *ArchitectureBoundaryAuditor) getModuleGraph() *moduleGraph {
 		}
 	}
 
+	if targetPath != "" {
+		// Layer rules read the target's and its direct dependencies' layer
+		// properties; nothing else is needed for a scoped audit.
+		a.hydrateModuleNode(mg, targetPath)
+		for _, edge := range mg.outEdges[targetPath] {
+			a.hydrateModuleNode(mg, edge.target)
+		}
+	}
+
 	return mg
+}
+
+// hydrateModuleNode loads one module node into the graph so its layer property
+// is available. Missing nodes are left absent to preserve the whole-graph
+// behavior, where an unindexed file contributes no metrics.
+func (a *ArchitectureBoundaryAuditor) hydrateModuleNode(mg *moduleGraph, filePath string) {
+	if _, ok := mg.nodes[filePath]; ok {
+		return
+	}
+	if node, ok := a.db.GetNode("file:" + filePath); ok {
+		mg.nodes[filePath] = node
+	}
+}
+
+// fileNodePath extracts the workspace-relative path from a stable node ID such
+// as "file:src/main.go".
+func fileNodePath(id string) (string, bool) {
+	const prefix = "file:"
+	if !strings.HasPrefix(id, prefix) {
+		return "", false
+	}
+	return strings.TrimPrefix(id, prefix), true
 }
 
 func (a *ArchitectureBoundaryAuditor) detectLayer(filePath string, customLayer any) string {
@@ -127,7 +186,8 @@ func (a *ArchitectureBoundaryAuditor) normalizeTargetPath(filePath string) strin
 // CheckLayerViolation audits architecture boundaries, circular dependencies, and coupling instability.
 func (a *ArchitectureBoundaryAuditor) CheckLayerViolation(filePath string, customRules []config.ArchRule) map[string]any {
 	defer a.db.BeginReadSession()()
-	mg := a.getModuleGraph()
+	targetPath := a.normalizeTargetPath(filePath)
+	mg := a.getModuleGraph(targetPath)
 	rules := customRules
 	if len(rules) == 0 && a.config != nil && len(a.config.ArchRules.Rules) > 0 {
 		rules = a.config.ArchRules.Rules
@@ -137,7 +197,6 @@ func (a *ArchitectureBoundaryAuditor) CheckLayerViolation(filePath string, custo
 	}
 
 	var violations []map[string]any
-	targetPath := a.normalizeTargetPath(filePath)
 
 	// 1. Check Layer Rule Violations
 	for src, edges := range mg.outEdges {
@@ -357,9 +416,6 @@ func tarjanSCC(mg *moduleGraph) [][]string {
 
 		for _, edge := range mg.outEdges[v] {
 			w := edge.target
-			if _, ok := mg.nodes[w]; !ok {
-				continue
-			}
 			if _, visited := indices[w]; !visited {
 				strongconnect(w)
 				if lowlink[w] < lowlink[v] {
@@ -387,7 +443,9 @@ func tarjanSCC(mg *moduleGraph) [][]string {
 		}
 	}
 
-	for node := range mg.nodes {
+	// The import edge set defines the module graph. Nodes are not required
+	// here because scoped audits skip hydrating modules that carry no edges.
+	for node := range mg.outEdges {
 		if _, visited := indices[node]; !visited {
 			strongconnect(node)
 		}
